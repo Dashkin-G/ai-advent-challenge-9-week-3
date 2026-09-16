@@ -131,6 +131,10 @@ ROUTER_SYSTEM = (
     "память. Не клади вежливость, рассуждения, пересказ общеизвестного и то, о чём только спросили, "
     "но не решили.\n"
     "\n"
+    # Место для правил, которые живут за пределами модели памяти: сейчас это
+    # профиль пользователя (app/persona.py). Свои правила он приносит сам, а
+    # маршрутизатор остаётся одним вызовом на обращение — второй стоил бы столько же.
+    "{extra}"
     "Правила: ключ — короткое существительное или словосочетание (до четырёх слов); значение — одна "
     "короткая фраза; изменился факт — замени значение под тем же ключом; отменён — не возвращай "
     "этот ключ; ничего не выдумывай; не больше {limit} записей в долговременной памяти и не больше "
@@ -141,7 +145,7 @@ ROUTER_SYSTEM = (
     '"steps": [{{"text": "...", "done": true}}], "findings": ["..."], "artifacts": ["..."], '
     '"questions": ["..."]}}, '
     '"long": {{"profile": {{"ключ": "значение"}}, "decisions": {{}}, "knowledge": {{}}, '
-    '"invariants": {{}}}}}}'
+    '"invariants": {{}}}}{schema}}}'
 )
 
 ROUTER_USER = (
@@ -755,8 +759,22 @@ def apply_recall(arguments: dict, long: LongTerm, task: Task | None) -> str:
 
 # --- Маршрутизатор: разбор ответа модели -------------------------------------
 
-def router_messages(name: str, task: Task | None, long: LongTerm, batch: list[dict]) -> list[dict]:
-    """Собрать запрос маршрутизатора: текущие слои, этап автомата и новые сообщения."""
+def router_messages(
+    name: str,
+    task: Task | None,
+    long: LongTerm,
+    batch: list[dict],
+    extra_rules: str = "",
+    extra_schema: str = "",
+    extra_input: str = "",
+) -> list[dict]:
+    """Собрать запрос маршрутизатора: текущие слои, этап автомата и новые сообщения.
+
+    Три `extra_*` — место для того, что маршрутизатор раскладывает помимо слоёв
+    памяти (сейчас это профиль пользователя): правила, кусок JSON-схемы ответа и
+    текущее состояние на вход. Строками, а не объектом, нарочно: модель памяти не
+    должна знать, что там за сущность, — иначе граница между модулями исчезнет.
+    """
     listing = "\n".join(
         f"[{'пользователь' if m['role'] == 'user' else 'агент'}] {m['content']}" for m in batch
     )
@@ -766,21 +784,25 @@ def router_messages(name: str, task: Task | None, long: LongTerm, batch: list[di
         {"role": "system", "content": ROUTER_SYSTEM.format(
             name=name, limit=config.LONG_LIMIT, items=config.TASK_ITEMS_LIMIT,
             states=states_listing(), state=state,
-            allowed=", ".join(allowed) if allowed else "никуда, задача завершена")},
+            allowed=", ".join(allowed) if allowed else "никуда, задача завершена",
+            extra=(extra_rules + "\n") if extra_rules else "",
+            schema=(", " + extra_schema) if extra_schema else "")},
         {"role": "user", "content": ROUTER_USER.format(
             task=(f"этап {task.state}, шаг {task.step} из {task.total}\n" + task.text())
             if task is not None and task else "(задачи нет)",
             long=json.dumps(_long_payload(long), ensure_ascii=False) if long else "(пусто)",
-            count=len(batch), messages=listing)},
+            count=len(batch), messages=listing) + (f"\n\n{extra_input}" if extra_input else "")},
     ]
 
 
 def parse_router(content: str) -> dict | None:
     """Разобрать ответ маршрутизатора в нормализованный вид.
 
-    Возвращает `{"task": {...}|None, "long": {вид: {ключ: значение}}}` или None,
-    если это вообще не разобрать: тогда агент оставит слои как были — сбой формата
-    не повод стирать память.
+    Возвращает `{"task": {...}|None, "long": {вид: {ключ: значение}}, "raw": {…}}`
+    или None, если это вообще не разобрать: тогда агент оставит слои как были —
+    сбой формата не повод стирать память. В `raw` лежит разобранный JSON целиком:
+    из него свою часть берут те, кто ездит с маршрутизатором за компанию (профиль
+    пользователя), а модель памяти про них по-прежнему ничего не знает.
     """
     data = extract_json(content)
     if not isinstance(data, dict):
@@ -804,7 +826,7 @@ def parse_router(content: str) -> dict | None:
             if name and text:
                 bucket[name] = text
 
-    return {"task": _parse_task(data.get("task")), "long": long_items}
+    return {"task": _parse_task(data.get("task")), "long": long_items, "raw": data}
 
 
 def _parse_task(raw: object) -> dict | None:

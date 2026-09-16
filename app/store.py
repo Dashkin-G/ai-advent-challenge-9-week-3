@@ -48,6 +48,7 @@
 пятки. Битая база не роняет запуск: файл откладывается рядом, приложение стартует
 с чистым состоянием.
 """
+import json
 import logging
 import sqlite3
 import threading
@@ -59,7 +60,7 @@ from . import config
 
 logger = logging.getLogger("app.store")
 
-VERSION = 7  # версия схемы, хранится в PRAGMA user_version
+VERSION = 8  # версия схемы, хранится в PRAGMA user_version
 
 MAIN_BRANCH = 0  # основная ветка: строки в branches у неё нет, это просто «ветка 0»
 
@@ -91,6 +92,11 @@ AGENT_COLUMNS = {
     "summarize": "INTEGER",                      # сжимать ли историю (NULL — ещё не записано)
     "summary_every": "INTEGER",                  # сообщений за окном до обновления суммаризации
     "working": "INTEGER NOT NULL DEFAULT 1",     # включён ли слой рабочей памяти
+    # Какой профиль пользователя подключён к запросам этого агента. Здесь только
+    # ссылка: сами профили лежат в отдельной таблице и не привязаны ни к агенту,
+    # ни к ветке — один профиль можно отдать нескольким агентам, а переключение
+    # между профилями не трогает переписку. Пустая строка — без профиля.
+    "persona": "TEXT NOT NULL DEFAULT ''",
 }
 
 MESSAGE_COLUMNS = {
@@ -137,6 +143,8 @@ USAGE_COLUMNS = {
     "task_tokens": "INTEGER NOT NULL DEFAULT 0",         # из контекста — карточка задачи
     "long_items": "INTEGER NOT NULL DEFAULT 0",          # сколько записей было в долговременной памяти
     "task_items": "INTEGER NOT NULL DEFAULT 0",          # сколько пунктов было в карточке задачи
+    "persona_tokens": "INTEGER NOT NULL DEFAULT 0",      # из контекста — профиль пользователя
+    "persona": "TEXT NOT NULL DEFAULT ''",               # какой профиль был подключён
 }
 
 # Суммаризации: по строке на версию. Отдельная таблица, а не колонка в agents, потому
@@ -241,6 +249,26 @@ BRANCH_COLUMNS = {
     "at": "REAL NOT NULL DEFAULT 0",
 }
 
+# Профили пользователя: по строке на профиль. ЕДИНСТВЕННАЯ таблица без `agent_id` —
+# и это не небрежность, а смысл сущности: профиль описывает человека, а не разговор,
+# поэтому он переживает и смену агента, и удаление переписки, и его можно отдать
+# сразу нескольким агентам. Ссылка на выбранный профиль лежит у агента (колонка
+# `agents.persona`). Списки (ограничения и предпочтения) хранятся строками JSON —
+# как и списки карточки задачи: они короткие, а отдельная таблица на пункт
+# превратила бы правку профиля в россыпь запросов.
+PERSONA_COLUMNS = {
+    "id": "TEXT PRIMARY KEY",
+    "name": "TEXT NOT NULL DEFAULT ''",
+    "about": "TEXT NOT NULL DEFAULT ''",          # кто пользователь, своими словами
+    "style": "TEXT NOT NULL DEFAULT ''",          # код стиля общения из config.PERSONA_STYLES
+    "format": "TEXT NOT NULL DEFAULT ''",         # код формата ответа
+    "length": "TEXT NOT NULL DEFAULT ''",         # код длины ответа
+    "limits": "TEXT NOT NULL DEFAULT '[]'",       # JSON: коды ограничений и свои фразы
+    "prefs": "TEXT NOT NULL DEFAULT '[]'",        # JSON: [{"key", "value", "source", "turn", "at"}]
+    "created_at": "REAL NOT NULL DEFAULT 0",
+    "updated_at": "REAL NOT NULL DEFAULT 0",
+}
+
 # Таблицы с внешним ключом на agents: удаление агента уносит их строки каскадом.
 TABLES = {
     "messages": MESSAGE_COLUMNS,
@@ -313,10 +341,15 @@ class Store:
 
     def _create_schema(self) -> None:
         agents = ", ".join(f"{name} {declaration}" for name, declaration in AGENT_COLUMNS.items())
+        personas = ", ".join(f"{name} {declaration}" for name, declaration in PERSONA_COLUMNS.items())
         cascade = "FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE"
         with self._connect() as conn:
             conn.execute(f"CREATE TABLE IF NOT EXISTS agents ({agents})")
             self._add_new_columns(conn, "agents", AGENT_COLUMNS)
+            # Профили — рядом с агентами, а не в TABLES: каскада на агента у них нет,
+            # иначе удаление агента уносило бы профиль его хозяина.
+            conn.execute(f"CREATE TABLE IF NOT EXISTS personas ({personas})")
+            self._add_new_columns(conn, "personas", PERSONA_COLUMNS)
             for table, columns in TABLES.items():
                 declared = ", ".join(f"{name} {declaration}" for name, declaration in columns.items())
                 # Внешний ключ дописан отдельной строкой: ALTER TABLE его добавить не
@@ -353,6 +386,20 @@ class Store:
         with self._connect() as conn:
             row = conn.execute("SELECT id FROM agents WHERE active = 1").fetchone()
         return row["id"] if row else None
+
+    def personas(self) -> list[dict]:
+        """Профили пользователя, в порядке создания. Общие для всех агентов."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM personas ORDER BY created_at, rowid").fetchall()
+        return [_persona(row) for row in rows]
+
+    def persona(self, persona_id: str) -> dict | None:
+        """Один профиль по ссылке из настроек агента (None — такого профиля нет)."""
+        if not persona_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM personas WHERE id = ?", (persona_id,)).fetchone()
+        return _persona(row) if row else None
 
     def messages(self, agent_id: str, branch: int = MAIN_BRANCH, limit: int | None = None) -> list[dict]:
         """Переписка ветки агента: вся или последние `limit` сообщений, по порядку."""
@@ -503,6 +550,30 @@ class Store:
         """Записать паспорт, настройки и счётчики агента (переписку не трогаем)."""
         with self._connect() as conn:
             self._upsert(conn, state)
+
+    def save_persona(self, persona: dict) -> None:
+        """Записать профиль пользователя: новый или правку существующего.
+
+        Отдельной операцией, а не вместе с обращением: профиль не привязан к
+        разговору, и правят его чаще руками в окне, чем моделью после ответа.
+        """
+        row = _persona_row(persona)
+        columns = ", ".join(row)
+        marks = ", ".join(f":{name}" for name in row)
+        updates = ", ".join(f"{name} = excluded.{name}" for name in row
+                            if name not in ("id", "created_at"))
+        with self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO personas ({columns}) VALUES ({marks}) "
+                f"ON CONFLICT(id) DO UPDATE SET {updates}",
+                row,
+            )
+
+    def remove_persona(self, persona_id: str) -> None:
+        """Убрать профиль. Агенты, которые на него ссылались, останутся без профиля."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM personas WHERE id = ?", (persona_id,))
+            conn.execute("UPDATE agents SET persona = '' WHERE persona = ?", (persona_id,))
 
     def save_turn(
         self,
@@ -848,6 +919,7 @@ def _row(state: dict) -> dict:
         "summarize": None if settings.get("summarize") is None else int(bool(settings["summarize"])),
         "summary_every": settings.get("summary_every"),
         "working": int(bool(settings.get("working"))),
+        "persona": settings.get("persona") or "",
     }
 
 
@@ -867,6 +939,7 @@ def _state(row: sqlite3.Row) -> dict:
         "summarize": None if row["summarize"] is None else bool(row["summarize"]),
         "summary_every": row["summary_every"],
         "working": bool(row["working"]),
+        "persona": row["persona"] if "persona" in row.keys() else "",
     }
     if "compression" in row.keys():
         # Колонка из базы позапрошлой версии, где сжатие было отдельным тумблером:
@@ -884,3 +957,49 @@ def _state(row: sqlite3.Row) -> dict:
         },
         "settings": settings,
     }
+
+
+def _persona_row(persona: dict) -> dict:
+    """Профиль пользователя → плоская строка таблицы `personas`.
+
+    Списки уезжают строками JSON: хранилище не разбирает их содержимое, как не
+    разбирает списки карточки задачи, — это дело `app/persona.py`.
+    """
+    now = time.time()
+    return {
+        "id": str(persona.get("id") or ""),
+        "name": persona.get("name") or "",
+        "about": persona.get("about") or "",
+        "style": persona.get("style") or "",
+        "format": persona.get("format") or "",
+        "length": persona.get("length") or "",
+        "limits": json.dumps(persona.get("limits") or [], ensure_ascii=False),
+        "prefs": json.dumps(persona.get("prefs") or [], ensure_ascii=False),
+        "created_at": float(persona.get("created_at") or now),
+        "updated_at": float(persona.get("updated_at") or now),
+    }
+
+
+def _persona(row: sqlite3.Row) -> dict:
+    """Строка таблицы `personas` → профиль в том виде, в каком его отдал агент."""
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "about": row["about"],
+        "style": row["style"],
+        "format": row["format"],
+        "length": row["length"],
+        "limits": _load_json(row["limits"], []),
+        "prefs": _load_json(row["prefs"], []),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _load_json(raw: object, fallback: object) -> object:
+    """Разобрать JSON из базы; испорченная строка не должна ронять запуск."""
+    try:
+        value = json.loads(raw or "")
+    except (TypeError, ValueError):
+        return fallback
+    return value if isinstance(value, type(fallback)) else fallback

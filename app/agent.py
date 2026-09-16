@@ -44,6 +44,15 @@
 (`memory.rules_from_turn`), отдельный вызов-маршрутизатор после ответа (`_route`)
 и инструменты `remember` / `recall`, которыми агент кладёт в слой сам.
 
+Поверх памяти надет профиль пользователя (`app/persona.py`) — четвёртый блок
+инструкции и ответ на другой вопрос: не «что агент помнит», а «для кого он
+говорит». Профиль задаёт стиль, формат и ограничения ответа, подключается к
+КАЖДОМУ запросу и переключается на лету: один и тот же вопрос при разных профилях
+получает разные ответы. Наполняется он так же в три руки — человек правит в окне,
+маршрутизатор замечает просьбы в разговоре, агент кладёт инструментом `prefer`, —
+а после генерации ответ сверяется с профилем (`persona.check`), и расхождения
+видно под ответом.
+
 Что делать с тем, что выпало из окна краткосрочной памяти, решает стратегия
 контекста (`strategy`):
 
@@ -77,10 +86,15 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import config, llm, memory, tokens, tools
+from . import config, llm, memory, persona, tokens, tools
 from .store import MAIN_BRANCH, Store
 
 logger = logging.getLogger("app.agent")
+
+# «Свой профиль» для сборки инструкции. Нужен, потому что None здесь значит не
+# «по умолчанию», а «без профиля вообще»: теневой прогон умеет сравнивать ответ и
+# с другим профилем, и с полным его отсутствием.
+_SELF = object()
 
 
 class AgentError(Exception):
@@ -327,10 +341,15 @@ class Compression:
 
 @dataclass
 class Shadow:
-    """Теневой ответ для сравнения: тот же вопрос, но вся история как есть вместо стратегии.
+    """Теневой ответ для сравнения: тот же вопрос, но при других условиях.
 
     Считается и оплачивается по-настоящему, но в память не идёт: он нужен, только
-    чтобы положить рядом два ответа и два счёта — со стратегией и с полной историей.
+    чтобы положить рядом два ответа и два счёта. Сравнивать можно двумя способами,
+    и `kind` говорит, каким именно:
+
+        history   вся история как есть вместо стратегии контекста (день 9);
+        persona   тот же контекст, но другой профиль пользователя — так видно,
+                  что персонализация меняет сам ответ, а не только его тон.
     """
     text: str
     messages: int             # сколько сообщений истории ушло в модель
@@ -342,10 +361,16 @@ class Shadow:
     trimmed_pairs: int = 0    # даже полная история не влезла в окно — что-то выброшено
     tool_calls: int = 0       # модель попросила инструменты: теневой прогон их не исполняет
     finish_reason: str | None = None
+    kind: str = "history"     # с чем сравниваем: history / persona
+    label: str = ""           # подпись сравнения: «профиль «Новичок»»
+    checks: list = field(default_factory=list)   # соблюдён ли тот профиль (persona.Check)
 
     def to_dict(self) -> dict:
         return {
             "text": self.text,
+            "kind": self.kind,
+            "label": self.label,
+            "checks": [check.to_dict() for check in self.checks],
             "messages": self.messages,
             "breakdown": self.breakdown.to_dict(),
             "prompt_tokens": self.prompt_tokens,
@@ -394,6 +419,10 @@ class TokenReport:
     long_items: int = 0           # сколько в ней записей
     task_items: int = 0           # сколько пунктов в карточке задачи (0 — задачи нет)
     task_title: str = ""          # название открытой задачи
+    persona_id: str = ""          # какой профиль пользователя был подключён
+    persona_name: str = ""        # его название — для строки под ответом
+    persona_items: int = 0        # сколько в нём пунктов (0 — профиль не подключён)
+    persona_summary: str = ""     # стиль · формат · длина одной строкой
     task_state: str = ""          # этап автомата, на котором шло обращение
     task_step: int = 0            # номер текущего шага плана
     task_total: int = 0           # всего шагов в плане
@@ -463,6 +492,10 @@ class TokenReport:
             "long_items": self.long_items,
             "task_items": self.task_items,
             "task_title": self.task_title,
+            "persona_id": self.persona_id,
+            "persona_name": self.persona_name,
+            "persona_items": self.persona_items,
+            "persona_summary": self.persona_summary,
             "task_state": self.task_state,
             "task_step": self.task_step,
             "task_total": self.task_total,
@@ -500,6 +533,9 @@ class AgentReply:
     # Аннотация строкой: имя поля совпадает с именем модуля, и без кавычек Python
     # разобрал бы `memory.MemoryUpdate` уже по самому полю, а не по модулю.
     memory: "memory.MemoryUpdate | None" = None   # что и в какой слой памяти положено после ответа
+    # Та же ловушка с именем поля, что и у `memory`: имя совпадает с именем модуля,
+    # поэтому аннотация обязательно строкой.
+    persona: "persona.PersonaUpdate | None" = None   # правки профиля и сверка ответа с ним
     violations: list[str] = field(default_factory=list)  # какие инварианты нарушил ответ
     shadow: Shadow | None = None    # теневой ответ «с полной историей» для сравнения
     request: dict | None = None     # «сырой обмен»: тело последнего запроса
@@ -524,6 +560,7 @@ class AgentReply:
             "tokens": self.tokens.to_dict() if self.tokens else None,
             "compression": self.compression.to_dict() if self.compression else None,
             "memory": self.memory.to_dict() if self.memory else None,
+            "persona": self.persona.to_dict() if self.persona else None,
             "violations": list(self.violations),
             "shadow": self.shadow.to_dict() if self.shadow else None,
             "request": self.request,
@@ -565,6 +602,10 @@ class Agent:
     summarize: bool = config.AGENT_SUMMARIZE      # сжимать ли историю — опция поверх любой стратегии
     summary_every: int = config.AGENT_SUMMARY_EVERY  # сколько сообщений копить до обновления суммаризации
     working: bool = config.AGENT_WORKING          # вести ли слой рабочей памяти (карточку задачи)
+    # Профиль пользователя — ссылкой, а не объектом: профили общие для всех агентов
+    # и лежат отдельно от переписки, поэтому в настройках агента хранится только id
+    # (пусто — работать без профиля), а сам профиль поднимается из хранилища.
+    persona_id: str = config.AGENT_PERSONA
 
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created_at: float = field(default_factory=time.time)
@@ -583,9 +624,16 @@ class Agent:
     # новый обмен, который маршрутизатор ещё не разложил по слоям.
     _pending_summary: list[dict] = field(default_factory=list, repr=False)  # ждут суммаризации
     _pending_route: list[dict] = field(default_factory=list, repr=False)    # ждут маршрутизации
+    # Профиль пользователя: сам объект (см. app/persona.py). Аннотация строкой —
+    # имя поля совпадает с именем модуля.
+    _persona: "persona.Persona | None" = field(default=None, repr=False)
     # Что агент положил в слои инструментом за это обращение — копится по ходу цикла
     # и уходит в трассу вместе с решениями маршрутизатора.
     _tool_routes: list = field(default_factory=list, repr=False)
+    # То же самое для профиля: правки этого обращения (инструментом и маршрутизатором)
+    # и результат сверки ответа с профилем. Наполняется по ходу, как и `_live`.
+    _persona_update: "persona.PersonaUpdate" = field(
+        default_factory=persona.PersonaUpdate, repr=False)
     # Память обращения, которая наполняется по ходу: правила срабатывают сразу, а не
     # после ответа, и переходы автомата видно в момент, когда они происходят.
     _live: "memory.MemoryUpdate" = field(default_factory=memory.MemoryUpdate, repr=False)
@@ -593,14 +641,35 @@ class Agent:
     _state_before: str = field(default=config.AGENT_TASK_STATE, repr=False)  # этап на начало обращения
     _branch: dict = field(default_factory=_main_branch, repr=False)  # описание активной ветки
 
+    def __post_init__(self) -> None:
+        """Профиль пользователя поднимается сразу: он нужен уже первому запросу.
+
+        Остальные слои читаются из истории и потому поднимаются в `restore`, а
+        профиль лежит вне переписки — его можно взять и у только что созданного
+        агента.
+        """
+        if self.store is not None and self._persona is None and self.persona_id:
+            self._load_persona()
+
     # ------------------------------------------------------------------- вход --
 
-    def ask(self, message: str, compare: bool = False, on_event=None) -> AgentReply:
+    def ask(
+        self,
+        message: str,
+        compare: bool = False,
+        on_event=None,
+        compare_with: "str | persona.Persona | None" = None,
+    ) -> AgentReply:
         """Единственный публичный вход: принять запрос и вернуть ответ агента.
 
         `compare=True` — заодно получить теневой ответ на тот же вопрос, но с
         полной историей вместо стратегии контекста: два ответа и два счёта рядом.
         Настоящий ответ при этом один — тот, что идёт в память.
+
+        `compare_with` — то же сравнение, но по другой оси: тот же вопрос и тот же
+        контекст, а профиль пользователя другой. Принимает id профиля, сам профиль
+        или пустую строку («ответить вообще без профиля»); None — не сравнивать.
+        Это и есть проверка задания «ответы для разных профилей» в один приём.
 
         `on_event(kind, data)` — необязательный колбэк прогресса. Обращение может
         занять полминуты, и за это время агент успевает составить план, выполнить
@@ -614,6 +683,9 @@ class Agent:
         totals = _Totals()
         steps: list[AgentStep] = []
         self._tool_routes = []   # что агент положит в слои сам, инструментом
+        self._persona_update = persona.PersonaUpdate(
+            name=self._persona.name if self._persona else "",
+        )
         self._notify = on_event if callable(on_event) else _silent
         # Этап на начало обращения: маршрутизатор увидит именно его и, «оставляя всё
         # как есть», вернёт то же значение. Если к тому моменту код уже сдвинул этап
@@ -641,11 +713,13 @@ class Agent:
         summary_block = self._summary_block()               #    блоки слоёв внутри инструкции
         long_block = self._long_block() + self._invariants_block()
         task_block = self._task_block()
+        persona_block = self._persona_block()               #    профиль пользователя — тоже блок
         window, dropped = self._fit_context(prompt, text, specs)   # 3. бюджет контекста
         beyond, beyond_tokens = self._beyond_window()
         report = TokenReport(
             breakdown=tokens.measure(prompt, window, text, specs, self.model,
-                                     summary=summary_block, long=long_block, task=task_block),
+                                     summary=summary_block, long=long_block, task=task_block,
+                                     persona=persona_block),
             limit=self._context_limit(),
             reserve=self._answer_reserve(),
             max_output=config.model_max_output(self.model),
@@ -661,6 +735,10 @@ class Agent:
             long_items=len(self._long.notes) if long_block else 0,
             task_items=self._task.size() if task_block else 0,
             task_title=self._task.title if task_block else "",
+            persona_id=self._persona.id if self._persona else "",
+            persona_name=self._persona.name if self._persona else "",
+            persona_items=self._persona.size() if self._persona else 0,
+            persona_summary=self._persona.summary() if self._persona else "",
             task_state=self._task.state if task_block else "",
             task_step=self._task.step if task_block else 0,
             task_total=self._task.total if task_block else 0,
@@ -673,13 +751,13 @@ class Agent:
         report.estimated = report.breakdown.total
         messages = self._build_messages(prompt, window, text)      #    сборка запроса
         logger.info(
-            "Агент «%s» [%s]: в запрос уйдёт ≈%d токенов (инструкция %d + суммаризация %d + "
-            "долговременная %d + задача %d + память %d + вопрос %d + схемы %d) из окна %d · "
-            "за окном %d сообщ. ≈ %d токенов",
+            "Агент «%s» [%s]: в запрос уйдёт ≈%d токенов (инструкция %d + профиль %d + "
+            "суммаризация %d + долговременная %d + задача %d + память %d + вопрос %d + схемы %d) "
+            "из окна %d · за окном %d сообщ. ≈ %d токенов",
             self.profile.name, self.id, report.estimated, report.breakdown.system,
-            report.breakdown.summary, report.breakdown.long, report.breakdown.task,
-            report.breakdown.memory, report.breakdown.question, report.breakdown.tools,
-            report.limit, beyond, beyond_tokens,
+            report.breakdown.persona, report.breakdown.summary, report.breakdown.long,
+            report.breakdown.task, report.breakdown.memory, report.breakdown.question,
+            report.breakdown.tools, report.limit, beyond, beyond_tokens,
         )
 
         raw, first_usage = None, None
@@ -705,10 +783,16 @@ class Agent:
 
         answer = self._postprocess(raw["content"], steps)   # 5. разбор ответа
         violations = self._check_invariants(answer)         #    сверка ответа с инвариантами
-        shadow = self._shadow(plan, text, specs, totals) if compare else None
+        self._check_persona(answer)                         #    сверка ответа с профилем пользователя
+        shadow = None
+        if compare:
+            shadow = self._shadow(plan, text, specs, totals)
+        elif compare_with is not None:
+            shadow = self._shadow(plan, text, specs, totals, who=self._other_persona(compare_with))
         self.turns += 1
         pair = self._remember(text, answer)                 # 6. краткосрочный слой: окно и очереди
         routed = self._route(plan, steps, totals)           #    рабочий и долговременный слои
+        personal = self._persona_report(report)             #    профиль: правки за обращение и сверка
         folded = self._compress(totals)                     #    сжатие: очередь набралась — свернуть
         self._close_report(report, totals, raw, first_usage)
         self._save(pair, report, totals, shadow, routed)    #    история, состояние, расход — одной записью
@@ -742,6 +826,7 @@ class Agent:
             tokens=report,
             compression=folded,
             memory=routed,
+            persona=personal,
             violations=violations,
             shadow=shadow,
             request=raw["request"],
@@ -823,7 +908,8 @@ class Agent:
         """
         if not self.tools_enabled:
             return None
-        return tools.specs() + memory.tool_specs(self._long_on, self.working)
+        return (tools.specs() + memory.tool_specs(self._long_on, self.working)
+                + persona.tool_specs(self._persona is not None))
 
     @property
     def _long_on(self) -> bool:
@@ -916,22 +1002,31 @@ class Agent:
         plan: list[str],
         window: list[dict] | None = None,
         blocks: bool = True,
+        who: object = _SELF,
     ) -> str:
-        """Роль агента, дополненная правилами про инструменты, слои памяти и план.
+        """Роль агента, дополненная правилами про инструменты, слои памяти, профиль и план.
 
         Роль пишет пользователь, и полагаться на неё в этих вопросах нельзя: про
         инструменты, суммаризацию, долговременную память, текущую задачу и само
         наличие памяти агент рассказывает модели сам. `memory` — окно, которое
         пойдёт следом (по умолчанию своё), `blocks=False` собирает инструкцию без
         блоков слоёв — так строится теневой запрос «с полной историей».
+
+        `who` — чей профиль подключить: по умолчанию свой, `None` — вообще без
+        профиля, другой профиль — для теневого сравнения «ответы для разных
+        профилей». Профиль идёт последним блоком, перед самим вопросом: это
+        требования к ответу, и модель точнее держит их, когда они рядом с задачей.
         """
         window = self._memory if window is None else window
         prompt = self.profile.instructions
+        profile = self._persona if who is _SELF else who
         if self.tools_enabled:
             prompt += TOOLS_NOTE
             prompt += f"\n\nРабочая папка для файловых инструментов: {tools.workspace()}"
             if self._long_on or self.working:
                 prompt += MEMORY_TOOLS_NOTE
+            if profile is not None:
+                prompt += persona.TOOLS_NOTE
         block = (self._summary_block() + self._long_block() + self._invariants_block()
                  + self._task_block()) if blocks else ""
         prompt += block
@@ -945,6 +1040,8 @@ class Agent:
                 "\n\nТы сам составил план на эту задачу:\n" + listed +
                 "\nСледуй ему. Если по ходу дела план оказался неверным — скажи об этом в ответе."
             )
+        if profile is not None:
+            prompt += profile.block()
         return prompt
 
     def _summary_block(self) -> str:
@@ -1008,6 +1105,15 @@ class Agent:
             return ""
         return memory.INVARIANTS_NOTE.format(count=len(items), items=self._long.invariants_text())
 
+    def _persona_block(self) -> str:
+        """Профиль пользователя в том виде, в каком он уходит в инструкцию.
+
+        Пусто, если профиль не подключён. В отличие от слоёв памяти, у профиля нет
+        «накопления»: он полностью известен заранее, поэтому и в запрос уходит
+        всегда целиком — и стоит одинаково в каждом обращении.
+        """
+        return self._persona.block() if self._persona is not None else ""
+
     def _call(
         self,
         messages: list[dict],
@@ -1063,6 +1169,8 @@ class Agent:
         started = time.perf_counter()
         if name in memory.TOOL_NAMES:
             result, ok = self._memory_tool(name, arguments)
+        elif name in persona.TOOL_NAMES:
+            result, ok = self._persona_tool(name, arguments)
         else:
             try:
                 result, ok = tools.call(name, call["arguments"]), True
@@ -1077,7 +1185,8 @@ class Agent:
             "ок" if ok else "ошибка", elapsed,
         )
         tool = tools.BY_NAME.get(name)
-        title = tool.title if tool else memory.TOOL_TITLES.get(name, name)
+        title = tool.title if tool else (
+            memory.TOOL_TITLES.get(name) or persona.TOOL_TITLES.get(name, name))
         return AgentStep(
             number=number,
             tool=name,
@@ -1126,6 +1235,58 @@ class Agent:
             return result, True
         except ValueError as e:
             return f"Ошибка инструмента: {e}", False
+
+    def _persona_tool(self, name: str, arguments: dict) -> tuple[str, bool]:
+        """Исполнить `prefer`: агент сам правит профиль своего собеседника.
+
+        Третий источник правок профиля — тот, где решение принимает агент по ходу
+        разговора («просили короче — закреплю в профиле»). Как и у инструментов
+        памяти, схема живёт в своём модуле, а исполнение здесь: правится профиль
+        этого агента, и знать о нём чистая функция инструмента не может.
+        """
+        try:
+            result, change = persona.apply_prefer(arguments, self._persona, self.turns + 1)
+        except ValueError as e:
+            return f"Ошибка инструмента: {e}", False
+        if change.action != "keep":
+            self._persona_update.changes.append(change)
+            logger.info("Агент «%s» [%s]: инструмент профиля — %s",
+                        self.profile.name, self.id, change.what)
+        return result, True
+
+    def _check_persona(self, answer: str) -> None:
+        """Сверить готовый ответ с профилем: длина, формат и ограничения.
+
+        Ровно то, чего не хватает обычной персонализации «через промпт»: просьба
+        уходит в модель, а соблюли её или нет — никто не смотрит. Ответ при
+        нарушении не перегенерируется (это было бы вдвое дороже), но расхождение
+        показывается под ответом.
+        """
+        self._persona_update.checks = persona.check(answer, self._persona)
+        broken = self._persona_update.broken
+        if broken:
+            logger.warning(
+                "Агент «%s» [%s]: ответ разошёлся с профилем «%s» — %s",
+                self.profile.name, self.id, self._persona.name if self._persona else "",
+                "; ".join(f"{check.label}: {check.detail}" for check in broken),
+            )
+
+    def _persona_report(self, report: TokenReport) -> "persona.PersonaUpdate | None":
+        """Собрать итог по профилю за обращение: правки, отказы и сверка ответа."""
+        update = self._persona_update
+        update.tokens = report.breakdown.persona
+        if self._persona is not None:
+            update.name = self._persona.name
+        if not update:
+            return None
+        if update.changes:
+            logger.info(
+                "Агент «%s» [%s]: профиль «%s» обновлён — %s",
+                self.profile.name, self.id, update.name,
+                "; ".join(f"{change.what} ({config.persona_source_label(change.source)})"
+                          for change in update.changes),
+            )
+        return update
 
     def _live_rules(self, plan: list[str], steps: list[AgentStep]) -> None:
         """Применить правила рабочей памяти прямо по ходу обращения.
@@ -1198,8 +1359,12 @@ class Agent:
 
     @property
     def _routing(self) -> bool:
-        """Есть ли кому маршрутизировать: хотя бы один управляемый слой включён."""
-        return self._long_on or self.working
+        """Есть ли кому маршрутизировать: управляемый слой памяти или профиль.
+
+        Профиль попал сюда не для симметрии: просьбу «отвечай короче» замечает тот
+        же вызов, и без него персонализация осталась бы только ручной.
+        """
+        return self._long_on or self.working or self._persona is not None
 
     def _save(
         self,
@@ -1236,6 +1401,11 @@ class Agent:
             self._long.upto = saved["messages"][-1]
         if task_row is not None and saved["task"]:
             self._task.id = saved["task"]
+        # Профиль пишется отдельно, а не той же транзакцией: он не принадлежит ни
+        # этому разговору, ни этой ветке — им пользуются и другие агенты, и он
+        # переживёт даже «забыть разговор».
+        if self._persona is not None and self._persona_update.changes:
+            self.store.save_persona(self._persona.row())
 
     def _usage_row(self, report: TokenReport, totals: _Totals, shadow: Shadow | None = None) -> dict:
         """Расход обращения одной строкой — то, из чего потом рисуется рост цены."""
@@ -1265,6 +1435,8 @@ class Agent:
             "task_tokens": report.breakdown.task,
             "long_items": report.long_items,
             "task_items": report.task_items,
+            "persona_tokens": report.breakdown.persona,
+            "persona": report.persona_id,
         }
 
     def _trim_memory(self) -> None:
@@ -1454,10 +1626,23 @@ class Agent:
         return update
 
     def _call_router(self, batch: list[dict], totals: _Totals, update: memory.MemoryUpdate) -> bool:
-        """Вызов маршрутизатора: разложить новые сообщения по рабочему и долговременному слоям."""
+        """Вызов маршрутизатора: разложить новые сообщения по слоям памяти и профилю.
+
+        Профиль ездит тем же вызовом, а не своим: второй вызов после каждого ответа
+        стоил бы столько же, сколько первый, а решает ту же задачу — «что нового
+        прозвучало и куда это положить». Свои правила и свою часть JSON-схемы
+        профиль приносит сам (`app/persona.py`), поэтому модель памяти про него
+        по-прежнему не знает.
+        """
+        personal = self._persona is not None
         try:
             raw = totals.add(self._call(
-                memory.router_messages(self.profile.name, self._task, self._long, batch),
+                memory.router_messages(
+                    self.profile.name, self._task, self._long, batch,
+                    extra_rules=persona.router_rules() if personal else "",
+                    extra_schema=persona.ROUTER_SCHEMA if personal else "",
+                    extra_input=persona.router_input(self._persona),
+                ),
                 None,
                 temperature=config.ROUTER_TEMPERATURE,
                 max_tokens=config.ROUTER_MAX_TOKENS,
@@ -1476,6 +1661,21 @@ class Agent:
 
         update.called = True
         update.call_tokens = (raw.get("usage") or {}).get("total_tokens", 0)
+        if personal:
+            # Профиль приходит ЧАСТЯМИ, а не целиком, как слои: маршрутизатор
+            # возвращает только то, что просит изменить. Иначе он переписывал бы
+            # профиль на каждом обращении и затирал выставленное человеком.
+            wanted = persona.parse_update(parsed.get("raw"))
+            if wanted:
+                # То, что агент уже записал инструментом на этом обращении,
+                # маршрутизатор не перебивает: он его записи не видел и переписал бы
+                # их своими словами, подменив заодно источник (поймано живым прогоном).
+                changes, rejected = persona.merge(
+                    self._persona, wanted, self.turns, source="router",
+                    locked=persona.locked_by(self._persona_update.changes),
+                )
+                self._persona_update.changes.extend(changes)
+                self._persona_update.rejected.extend(rejected)
         if self._long_on and parsed["long"]:
             update.routes.extend(memory.merge_long(self._long, parsed["long"], self.turns))
         if self.working:
@@ -1555,23 +1755,38 @@ class Agent:
         text: str,
         specs: list[dict] | None,
         totals: _Totals,
+        who: object = _SELF,
     ) -> Shadow:
-        """Теневой ответ для сравнения: тот же вопрос, но вся история как есть.
+        """Теневой ответ для сравнения: тот же вопрос, но при других условиях.
 
-        Блоки слоёв в запрос не идут, вместо них — все сообщения истории
-        активной ветки, сколько влезает в окно модели. Ответ не запоминается и на
-        разговор не влияет: это измерение, а не обращение. Стоит он по-настоящему,
-        поэтому считается в расход обращения вместе с остальными вызовами.
+        Две оси сравнения, и обе нужны на экране:
+
+            контекст (`who` не задан) — вместо блоков слоёв в запрос уходит вся
+                история активной ветки, сколько влезает в окно модели;
+            профиль (`who` задан) — контекст ровно тот же, что у настоящего
+                ответа, а профиль пользователя другой (или его нет вовсе). Это и
+                есть «ответы для разных профилей»: разница в ответах не может
+                объясняться ничем, кроме профиля.
+
+        Ответ не запоминается и на разговор не влияет: это измерение, а не
+        обращение. Но стоит он по-настоящему, поэтому считается в расход.
         """
-        history = self._full_history()
-        prompt = self._system_prompt(plan, window=history, blocks=False)
-        room = self._context_limit() - self._answer_reserve()
-        fixed = tokens.measure(prompt, [], text, specs, self.model).total
-        window, dropped = list(history), 0
-        while window and fixed + tokens.measure_messages(window, self.model) > room:
-            del window[:2]
-            dropped += 1
-        breakdown = tokens.measure(prompt, window, text, specs, self.model)
+        swap = who is not _SELF
+        if swap:
+            window = list(self._memory)          # контекст тот же, меняется только профиль
+            prompt = self._system_prompt(plan, window=window, who=who)
+            dropped = 0
+        else:
+            history = self._full_history()
+            prompt = self._system_prompt(plan, window=history, blocks=False)
+            room = self._context_limit() - self._answer_reserve()
+            fixed = tokens.measure(prompt, [], text, specs, self.model).total
+            window, dropped = list(history), 0
+            while window and fixed + tokens.measure_messages(window, self.model) > room:
+                del window[:2]
+                dropped += 1
+        breakdown = tokens.measure(prompt, window, text, specs, self.model,
+                                   persona=who.block() if swap and who is not None else "")
 
         started = time.perf_counter()
         raw = totals.add(self._call(self._build_messages(prompt, window, text), specs))
@@ -1582,9 +1797,11 @@ class Agent:
                 "Модель попросила инструменты (" + ", ".join(c["name"] for c in raw["tool_calls"]) +
                 "): теневой прогон их не исполняет, сравнивать здесь можно только контекст."
             )
+        label = (f"профиль «{who.name}»" if swap and who is not None else
+                 "без профиля" if swap else "полная история")
         logger.info(
-            "Агент «%s» [%s]: теневой ответ с полной историей — %d сообщ., %d→%d токенов",
-            self.profile.name, self.id, len(window), usage.get("prompt_tokens", 0),
+            "Агент «%s» [%s]: теневой ответ — %s, %d сообщ., %d→%d токенов",
+            self.profile.name, self.id, label, len(window), usage.get("prompt_tokens", 0),
             usage.get("completion_tokens", 0),
         )
         return Shadow(
@@ -1598,7 +1815,29 @@ class Agent:
             trimmed_pairs=dropped,
             tool_calls=len(raw["tool_calls"]),
             finish_reason=raw["finish_reason"],
+            kind="persona" if swap else "history",
+            label=label,
+            checks=persona.check(content, who) if swap else [],
         )
+
+    def _other_persona(self, wanted: "str | persona.Persona") -> "persona.Persona | None":
+        """Профиль для сравнения: по id из хранилища, объектом или «без профиля».
+
+        Пустая строка — не ошибка, а осмысленный выбор: сравнить ответ с профилем и
+        без него. Незнакомый id — ошибка агента, а не молчаливая подмена: иначе
+        сравнение показало бы два одинаковых ответа и ничего не объяснило.
+        """
+        if isinstance(wanted, persona.Persona):
+            return wanted
+        code = str(wanted or "").strip()
+        if not code:
+            return None
+        if self.store is None:
+            raise AgentError("Сравнить профили можно только с хранилищем: профили лежат в нём.")
+        row = self.store.persona(code)
+        if row is None:
+            raise AgentError(f"Профиль «{code}» не найден.")
+        return persona.Persona.from_row(row)
 
     def _full_history(self) -> list[dict]:
         """Вся переписка активной ветки как есть — то, что ушло бы в модель без стратегии."""
@@ -1684,6 +1923,25 @@ class Agent:
                         self.id, len(self._long.notes))
             return
         self._long = memory.LongTerm()
+
+    def _load_persona(self) -> None:
+        """Поднять профиль пользователя по ссылке из настроек.
+
+        Профиль общий и лежит вне переписки, поэтому читается не из ветки, а из
+        своей таблицы. Нет ссылки или профиль удалили — агент работает без
+        профиля: это рабочее состояние, а не ошибка.
+        """
+        if self.store is None or not self.persona_id:
+            self._persona = None
+            return
+        row = self.store.persona(self.persona_id)
+        if row is None:
+            logger.info("Агент [%s]: профиль «%s» не найден — работаем без профиля",
+                        self.id, self.persona_id)
+            self.persona_id = ""
+            self._persona = None
+            return
+        self._persona = persona.Persona.from_row(row)
 
     def _load_task(self) -> None:
         """Поднять открытую задачу ветки: рабочая память тоже переживает перезапуск."""
@@ -1823,6 +2081,88 @@ class Agent:
         )
         self.persist()  # настройки тоже переживают перезапуск
 
+    # ----------------------------------------------- профиль пользователя --
+
+    @property
+    def persona(self) -> "persona.Persona | None":
+        """Профиль, подключённый к запросам этого агента (None — без профиля)."""
+        return self._persona
+
+    def personas(self) -> list[dict]:
+        """Все профили пользователя — их показывает интерфейс в переключателе."""
+        if self.store is None:
+            return [self._persona.to_dict()] if self._persona else []
+        return [persona.Persona.from_row(row).to_dict() for row in self.store.personas()]
+
+    def use_persona(self, persona_id: str) -> "persona.Persona | None":
+        """Переключить профиль пользователя. Пустая строка — работать без профиля.
+
+        Память и история при этом не меняются ни на байт: профиль лежит отдельно,
+        поэтому один и тот же разговор можно продолжить с другими требованиями к
+        ответам — ровно то, что задание просит проверить.
+        """
+        code = str(persona_id or "").strip()
+        if code and self.store is not None and self.store.persona(code) is None:
+            raise AgentError(f"Профиль «{code}» не найден. Выберите профиль из списка.")
+        self.persona_id = code
+        self._load_persona()
+        self.persist()
+        logger.info("Агент «%s» [%s]: профиль пользователя — %s", self.profile.name, self.id,
+                    f"«{self._persona.name}» ({self._persona.summary()})" if self._persona
+                    else "не подключён")
+        return self._persona
+
+    def edit_persona(self, values: dict) -> "persona.Persona":
+        """Правка активного профиля руками: проверки те же, что у настроек агента."""
+        if self._persona is None:
+            raise AgentError("Профиль не подключён — править нечего.")
+        try:
+            changes = persona.apply_values(self._persona, values)
+        except ValueError as e:
+            raise AgentError(str(e)) from e
+        if self.store is not None:
+            self.store.save_persona(self._persona.row())
+        logger.info("Агент «%s» [%s]: профиль «%s» правлен руками — %s",
+                    self.profile.name, self.id, self._persona.name,
+                    "; ".join(change.what for change in changes) or "без изменений")
+        return self._persona
+
+    def remove_persona(self, persona_id: str = "") -> None:
+        """Удалить профиль насовсем. Переписка и память при этом не страдают.
+
+        Агенты, которые на него ссылались, остаются без профиля — это рабочее
+        состояние, а не поломка. Удалили последний профиль — при следующем запуске
+        `load_personas` заведёт заготовки заново: пустой набор приложение понимает
+        как первый запуск.
+        """
+        code = str(persona_id or self.persona_id).strip()
+        if not code:
+            raise AgentError("Профиль не выбран — удалять нечего.")
+        if self.store is None:
+            raise AgentError("Без хранилища профили нигде не лежат — удалять нечего.")
+        self.store.remove_persona(code)
+        if self.persona_id == code:
+            self.persona_id = ""
+            self._persona = None
+            self.persist()
+        logger.info("Агент «%s» [%s]: профиль «%s» удалён", self.profile.name, self.id, code)
+
+    def create_persona(self, values: dict) -> "persona.Persona":
+        """Завести новый профиль пользователя и сразу подключить его к агенту."""
+        fresh = persona.Persona(id=uuid.uuid4().hex[:8], name="Профиль")
+        try:
+            persona.apply_values(fresh, values)
+        except ValueError as e:
+            raise AgentError(str(e)) from e
+        if self.store is not None:
+            self.store.save_persona(fresh.row())
+        self.persona_id = fresh.id
+        self._persona = fresh
+        self.persist()
+        logger.info("Агент «%s» [%s]: заведён профиль «%s» [%s]",
+                    self.profile.name, self.id, fresh.name, fresh.id)
+        return fresh
+
     def set_profile(
         self,
         name: str | None = None,
@@ -1852,6 +2192,10 @@ class Agent:
         отделена, чтобы переживать задачи и ветки, — значит забыть её можно только
         явно. Паспорт и настройки остаются: агент тот же самый, просто без прошлого.
         Стирать историю здесь важно, иначе после перезапуска забытое вернулось бы.
+
+        Профиль пользователя здесь не трогаем: он описывает человека, а не разговор,
+        и общий для всех агентов — стирать его вместе с перепиской значило бы
+        заставить заново рассказывать о себе после каждой очистки.
         """
         self._memory.clear()
         self._pending_summary.clear()
@@ -2076,6 +2420,7 @@ class Agent:
                 "summarize": self.summarize,
                 "summary_every": self.summary_every,
                 "working": self.working,
+                "persona": self.persona_id,
             },
         }
 
@@ -2112,6 +2457,9 @@ class Agent:
             summarize=summarize,
             summary_every=int(settings.get("summary_every") or config.AGENT_SUMMARY_EVERY),
             working=bool(settings.get("working", config.AGENT_WORKING)),
+            # Ссылка на профиль: у агента из базы прошлой версии её нет, и он
+            # продолжит работать без профиля, пока его не выберут.
+            persona_id=str(settings.get("persona") or ""),
             id=state.get("id") or uuid.uuid4().hex[:8],
             created_at=float(state.get("created_at") or time.time()),
             turns=int(state.get("turns") or 0),
@@ -2123,6 +2471,7 @@ class Agent:
         agent._load_summary()   # суммаризация раньше окна: от её границы зависит, что войдёт в окно
         agent._load_long()      # долговременная память раньше очередей: от её границы зависит очередь
         agent._load_task()
+        agent._load_persona()   # профиль вне переписки, но нужен до сборки первого запроса
         agent._load_memory()
         logger.info(
             "Агент «%s» [%s] восстановлен: %d обращений, ветка «%s», стратегия %s, сжатие %s · слои: "
@@ -2187,9 +2536,10 @@ class Agent:
         summary_block = self._summary_block()
         long_block = self._long_block() + self._invariants_block()
         task_block = self._task_block()
+        persona_block = self._persona_block()
         breakdown = tokens.measure(
             self._system_prompt([]), self._memory, "", specs, self.model,
-            summary=summary_block, long=long_block, task=task_block,
+            summary=summary_block, long=long_block, task=task_block, persona=persona_block,
         )
         limit = self._context_limit()
         history = self.transcript()
@@ -2242,6 +2592,11 @@ class Agent:
             "invariants": [note.to_dict() for note in self._long.invariants()],
             "long_active": bool(long_block),
             "long_tokens": breakdown.long,
+            # Профиль пользователя: не слой памяти, но такая же часть запроса —
+            # и стоит он в каждом обращении одинаково.
+            "persona": self._persona.to_dict() if self._persona else None,
+            "persona_active": bool(persona_block),
+            "persona_tokens": breakdown.persona,
             "route_pending": len(self._pending_route),
             "pending_messages": len(self._pending_summary),
             "pending_tokens": tokens.measure_messages(self._pending_summary, self.model),
@@ -2304,6 +2659,13 @@ class Agent:
             "long": self._long.to_dict(),
             "invariants": [note.to_dict() for note in self._long.invariants()],
             "long_active": bool(self._long_block() or self._invariants_block()),
+            # Персонализация: какой профиль подключён к каждому запросу и во что
+            # он обходится. Список профилей интерфейс берёт отдельно (`personas`) —
+            # в паспорте он был бы лишним походом в базу на каждую перерисовку.
+            "persona": self._persona.to_dict() if self._persona else None,
+            "persona_id": self.persona_id,
+            "persona_active": self._persona is not None,
+            "persona_tokens": tokens.measure_text(self._persona_block(), self.model),
             "states": config.TASK_STATES,
             "route_pending": len(self._pending_route),
             "pending_messages": len(self._pending_summary),
@@ -2311,7 +2673,8 @@ class Agent:
             "branch_name": self._branch["name"],
             "branch_origin": self._branch["origin"],
             "branch_shared": self._branch["shared"],
-            "tools": tools.catalog() + memory.tool_catalog(self._long_on, self.working),
+            "tools": (tools.catalog() + memory.tool_catalog(self._long_on, self.working)
+                      + persona.tool_catalog(self._persona is not None)),
             "workspace": str(tools.workspace()),
             # Память между запусками: сколько сохранено, где лежит и когда говорили
             "history_messages": self.history_size,
@@ -2340,6 +2703,25 @@ def load_agents(store: Store | None = None) -> tuple[list[Agent], Agent]:
     active_id = store.active_id()
     active = next((a for a in agents if a.id == active_id), agents[0])
     return agents, active
+
+
+def load_personas(store: Store | None = None) -> list["persona.Persona"]:
+    """Поднять профили пользователя, а при первом запуске — завести заготовки.
+
+    Симметрично `load_agents`: это единственное место, где решается, откуда в
+    приложении берутся профили. Заготовки пишутся в базу сразу, иначе ссылка на
+    профиль у нового агента вела бы в пустоту.
+    """
+    store = store if store is not None else Store()
+    rows = store.personas()
+    if rows:
+        return [persona.Persona.from_row(row) for row in rows]
+    fresh = persona.presets()
+    for item in fresh:
+        store.save_persona(item.row())
+    logger.info("Профилей в базе нет — заведены заготовки: %s",
+                ", ".join(f"«{item.name}»" for item in fresh))
+    return fresh
 
 
 def _strategy_and_summarize(settings: dict) -> tuple[str, bool]:

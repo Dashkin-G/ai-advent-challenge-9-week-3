@@ -184,9 +184,12 @@ class Breakdown:
     платятся в каждом обращении, память растёт с диалогом, а сам вопрос
     пользователя — обычно самая маленькая часть счёта. Части `summary`, `long` и
     `task` — это слои памяти: они лежат внутри system-сообщения, но считаются
-    отдельно, потому что их вес и есть цена каждого слоя.
+    отдельно, потому что их вес и есть цена каждого слоя. `persona` — профиль
+    пользователя: он тоже внутри инструкции, но платится в каждом запросе, и цену
+    персонализации видно только отдельной частью.
     """
     system: int = 0
+    persona: int = 0   # профиль пользователя: стиль, формат, ограничения
     summary: int = 0
     long: int = 0      # долговременная память: профиль, решения, знания
     task: int = 0      # рабочая память: карточка текущей задачи
@@ -196,13 +199,14 @@ class Breakdown:
 
     @property
     def total(self) -> int:
-        return (self.system + self.summary + self.long + self.task
+        return (self.system + self.persona + self.summary + self.long + self.task
                 + self.memory + self.question + self.tools)
 
     def parts(self) -> list[tuple[str, int]]:
         """Части в порядке показа — интерфейсу удобно рисовать их полосой."""
         return [
             ("инструкция", self.system),
+            ("профиль", self.persona),
             ("суммаризация", self.summary),
             ("долговременная", self.long),
             ("задача", self.task),
@@ -214,6 +218,7 @@ class Breakdown:
     def to_dict(self) -> dict:
         return {
             "system": self.system,
+            "persona": self.persona,
             "summary": self.summary,
             "long": self.long,
             "task": self.task,
@@ -233,20 +238,24 @@ def measure(
     summary: str = "",
     long: str = "",
     task: str = "",
+    persona: str = "",
 ) -> Breakdown:
     """Оценить будущий запрос по частям, с поправкой на токенайзер модели.
 
-    `summary`, `long` и `task` — блоки слоёв памяти, уже вписанные в `system`: их
-    вес вычитается из инструкции и показывается отдельными частями. Сумма частей
-    при этом остаётся весом целого запроса.
+    `summary`, `long` и `task` — блоки слоёв памяти, а `persona` — блок профиля
+    пользователя; все они уже вписаны в `system`, поэтому их вес вычитается из
+    инструкции и показывается отдельными частями. Сумма частей при этом остаётся
+    весом целого запроса.
     """
     fix = calibration(model)
     whole = count_message({"role": "system", "content": system}) + REQUEST_OVERHEAD
     folded = min(whole, count(summary)) if summary else 0
     sticky = min(whole - folded, count(long)) if long else 0
     working = min(whole - folded - sticky, count(task)) if task else 0
+    who = min(whole - folded - sticky - working, count(persona)) if persona else 0
     return Breakdown(
-        system=fix.apply(whole - folded - sticky - working),
+        system=fix.apply(whole - folded - sticky - working - who),
+        persona=fix.apply(who),
         summary=fix.apply(folded),
         long=fix.apply(sticky),
         task=fix.apply(working),

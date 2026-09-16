@@ -31,13 +31,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
-    QSlider, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QLineEdit, QMainWindow, QMenu, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
+    QSizePolicy, QSlider, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from . import config, memory
 from .agent import (
     DEFAULT_PROFILE, MEMORY_TURNS_MAX, Agent, AgentError, AgentProfile, AgentReply, load_agents,
+    load_personas,
 )
 from .store import MAIN_BRANCH, Store
 
@@ -62,6 +63,7 @@ SUMMARY = "#ff7eb6"   # суммаризация — сжатая память; 
 FACTS = "#3fc9b8"     # долговременная память «ключ — значение»: профиль, решения, знания
 TASK = "#f0a35e"      # рабочая память — карточка текущей задачи
 BRANCH = "#b48cff"    # ветки диалога и точки ветвления
+PERSONA = "#b7e26b"   # профиль пользователя: персонализация поверх памяти
 
 # Цвет слоя памяти. Краткосрочная — цветом обычной памяти: это она и есть, только
 # названная по модели; у сжатой части внутри неё свой цвет (SUMMARY).
@@ -168,6 +170,9 @@ QLabel#stepHeadErr {{ color: {ERR_TEXT}; font-family: Consolas, monospace; font-
 QLabel#summaryHead {{ color: {SUMMARY}; font-family: Consolas, monospace; font-size: 12px; }}
 QLabel#factsHead {{ color: {FACTS}; font-family: Consolas, monospace; font-size: 12px; }}
 QLabel#taskHead {{ color: {TASK}; font-family: Consolas, monospace; font-size: 12px; }}
+QLabel#personaHead {{ color: {PERSONA}; font-family: Consolas, monospace; font-size: 12px; }}
+/* Профиль пользователя в панели: название и его состав второй строкой. */
+QLabel#personaName {{ color: {PERSONA}; font-size: 13px; font-weight: 600; }}
 /* Строка задачи в шапке: рабочая память видна там же, где имя агента. */
 QLabel#taskLine {{ color: {TASK}; font-size: 12px; }}
 /* Метки веток в ленте: точка ветвления и место развилки. */
@@ -312,6 +317,7 @@ FIXED_PART = "#2f4a86"
 
 PART_COLORS = {
     "инструкция": "#7a5cff",
+    "профиль": PERSONA,
     "суммаризация": SUMMARY,
     "долговременная": FACTS,
     "задача": TASK,
@@ -349,16 +355,24 @@ class AskWorker(QThread):
     failed = Signal(str)
     progress = Signal(str, object)
 
-    def __init__(self, agent: Agent, message: str, compare: bool = False) -> None:
+    def __init__(
+        self,
+        agent: Agent,
+        message: str,
+        compare: bool = False,
+        compare_with: str | None = None,
+    ) -> None:
         super().__init__()
         self.agent = agent
         self.message = message
         self.compare = compare   # заодно теневой ответ «без сжатия» для сравнения
+        self.compare_with = compare_with   # id профиля для сравнения «ответы для разных профилей»
 
     def run(self) -> None:
         try:
             self.done.emit(self.agent.ask(
-                self.message, compare=self.compare, on_event=self.progress.emit
+                self.message, compare=self.compare, on_event=self.progress.emit,
+                compare_with=self.compare_with,
             ))
         except AgentError as e:
             self.failed.emit(str(e))
@@ -793,6 +807,10 @@ class ContextBar(QFrame):
         if strategy == "branches":
             parts.append(f"ветка «{state['branch_name']}»")
         sent = []
+        # Профиль пользователя идёт первым: он определяет не содержание ответа, а
+        # его форму, и платится в каждом запросе одинаково — в отличие от слоёв.
+        if state["persona_active"]:
+            sent.append(f"профиль «{state['persona']['name']}» ≈ {_num(state['persona_tokens'])} т.")
         if state["summary_active"]:
             sent.append(f"суммаризация №{state['summary']['version']} вместо {state['folded_messages']} "
                         f"сообщ. (≈ {_num(state['folded_tokens'])} → {_num(state['summary_tokens'])} т.)")
@@ -885,9 +903,13 @@ class UsageChart(QFrame):
             long = min(row.get("long_tokens") or row.get("facts_tokens") or 0,
                        row["context_tokens"] - summary)
             task = min(row.get("task_tokens") or 0, row["context_tokens"] - summary - long)
-            memory = min(row["memory_tokens"], row["context_tokens"] - summary - long - task)
+            who = min(row.get("persona_tokens") or 0,
+                      row["context_tokens"] - summary - long - task)
+            memory = min(row["memory_tokens"],
+                         row["context_tokens"] - summary - long - task - who)
             blocks = (
-                (row["context_tokens"] - memory - summary - long - task, FIXED_PART),  # инструкция, схемы, вопрос
+                (row["context_tokens"] - memory - summary - long - task - who, FIXED_PART),  # инструкция, схемы, вопрос
+                (who, PART_COLORS["профиль"]),               # профиль пользователя: платится всегда
                 (summary, PART_COLORS["суммаризация"]),      # сжатое начало разговора
                 (long, PART_COLORS["долговременная"]),       # профиль, решения, знания
                 (task, PART_COLORS["задача"]),               # рабочая память
@@ -1034,6 +1056,14 @@ class TokensDialog(QDialog):
         history.setObjectName("subtitle")
         history.setWordWrap(True)
         lay.addWidget(history)
+
+        # Персонализация платится иначе, чем память: её вес не растёт с разговором,
+        # зато взимается в каждом обращении — это стоит видеть отдельной строкой.
+        lay.addWidget(_section("ПЕРСОНАЛИЗАЦИЯ: ЦЕНА И ПРОВЕРКА"))
+        persona_note = QLabel(_persona_text(state, rows))
+        persona_note.setObjectName("subtitle")
+        persona_note.setWordWrap(True)
+        lay.addWidget(persona_note)
 
         lay.addWidget(_section("СТРАТЕГИЯ КОНТЕКСТА: ДО И ПОСЛЕ"))
         strategy_note = QLabel(_strategy_text(state, rows))
@@ -1287,6 +1317,185 @@ class ProfileDialog(QDialog):
         }
 
 
+class PersonaDialog(QDialog):
+    """Профиль пользователя: кто вы и в какой форме агент должен отвечать.
+
+    Три группы предпочтений — ровно те, что перечислены в задании: стиль, формат
+    (вместе с длиной) и ограничения. Готовые ограничения отмечаются флажками и
+    проверяются кодом после ответа; своё ограничение можно вписать словами — оно
+    уйдёт в инструкцию просьбой, и в подсказке так и сказано.
+
+    Одно окно на два случая, как у паспорта агента: завести профиль и поправить
+    существующий. При создании показываются заготовки, при правке — нет: они
+    затёрли бы то, что уже выбрано.
+    """
+
+    def __init__(self, parent: QWidget, current: dict | None = None) -> None:
+        super().__init__(parent)
+        self.current = current
+        self.setWindowTitle("Новый профиль пользователя" if current is None else "Профиль пользователя")
+        self.resize(560, 640)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        note = QLabel(
+            "Профиль уходит в каждый запрос отдельным блоком: агент подстраивает под него "
+            "стиль, формат и длину ответа. Длина, формат и отмеченные ограничения после "
+            "ответа проверяются — расхождение видно под ответом."
+        )
+        note.setObjectName("note")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        self.preset = QComboBox()
+        if current is None:
+            lay.addWidget(_section("ЗАГОТОВКА"))
+            for item in config.PERSONA_PRESETS:
+                self.preset.addItem(item["name"], item)
+            self.preset.currentIndexChanged.connect(self._fill_from_preset)
+            lay.addWidget(self.preset)
+
+        lay.addWidget(_section("НАЗВАНИЕ ПРОФИЛЯ"))
+        self.name = QLineEdit()
+        self.name.setMaxLength(40)
+        self.name.setPlaceholderText("Как назвать этот профиль — видно в панели")
+        lay.addWidget(self.name)
+
+        lay.addWidget(_section("КТО ВЫ"))
+        self.about = QPlainTextEdit()
+        self.about.setPlaceholderText(
+            "Чем занимаетесь и что агенту стоит держать в голове: «не программист, снимаю видео»"
+        )
+        self.about.setFixedHeight(64)
+        lay.addWidget(self.about)
+
+        # Стиль, формат и длина — выбором из реестров: значение, которого нет в
+        # реестре, нельзя ни объяснить модели, ни проверить в ответе.
+        self.style = QComboBox()
+        self.format = QComboBox()
+        self.length = QComboBox()
+        for caption, box, registry in (
+            ("СТИЛЬ ОБЩЕНИЯ", self.style, config.PERSONA_STYLES),
+            ("ФОРМАТ ОТВЕТА", self.format, config.PERSONA_FORMATS),
+            ("ДЛИНА ОТВЕТА", self.length, config.PERSONA_LENGTHS),
+        ):
+            lay.addWidget(_section(caption))
+            for item in registry:
+                box.addItem(item["label"], item["code"])
+                box.setItemData(box.count() - 1, item["rule"], Qt.ToolTipRole)
+            lay.addWidget(box)
+
+        lay.addWidget(_section("ОГРАНИЧЕНИЯ: ЧЕГО НЕ ДЕЛАТЬ"))
+        self.limit_boxes: dict[str, QCheckBox] = {}
+        for item in config.PERSONA_LIMITS:
+            box = QCheckBox(item["label"])
+            box.setToolTip(f"{item['rule']}\n\nПроверяется после ответа: {item['what']}.")
+            self.limit_boxes[item["code"]] = box
+            lay.addWidget(box)
+        self.own_limits = QPlainTextEdit()
+        self.own_limits.setPlaceholderText("Своё ограничение, по строке — уйдёт просьбой в инструкцию")
+        self.own_limits.setToolTip(
+            "Эти строки агент получит вместе с профилем, но проверить их код не может:\n"
+            "в отличие от флажков выше, они остаются просьбой."
+        )
+        self.own_limits.setFixedHeight(56)
+        lay.addWidget(self.own_limits)
+
+        lay.addWidget(_section("ПРЕДПОЧТЕНИЯ: КЛЮЧ: ЗНАЧЕНИЕ, ПО СТРОКЕ"))
+        self.prefs = QPlainTextEdit()
+        self.prefs.setPlaceholderText("примеры: из съёмок и монтажа\nединицы: в рублях")
+        self.prefs.setToolTip(
+            "То, чего нет в списках выше. Сюда же агент дописывает предпочтения,\n"
+            "замеченные в разговоре, — источник каждого видно в окне «Память и история»."
+        )
+        self.prefs.setFixedHeight(72)
+        lay.addWidget(self.prefs, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        # Удаление живёт здесь же, где правка: заводить ради него отдельную кнопку в
+        # панели незачем — профиль правят гораздо чаще, чем удаляют.
+        self.deleted = False
+        if current is not None:
+            remove = _ghost("Удалить")
+            remove.setToolTip(
+                "Удалить профиль насовсем. Переписка и память не пострадают: агенты,\n"
+                "которые им пользовались, останутся без профиля. Удалите все — при\n"
+                "следующем запуске заготовки появятся снова."
+            )
+            remove.clicked.connect(self._remove)
+            buttons.addWidget(remove)
+        apply_btn = QPushButton("Создать" if current is None else "Сохранить")
+        apply_btn.setObjectName("send")
+        apply_btn.setFixedHeight(40)
+        apply_btn.setCursor(Qt.PointingHandCursor)
+        apply_btn.clicked.connect(self.accept)
+        cancel = _ghost("Отмена")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        buttons.addWidget(apply_btn, 1)
+        lay.addLayout(buttons)
+
+        if current is None:
+            self._fill_from_preset()
+        else:
+            self._fill(current)
+        self.name.setFocus()
+
+    def _remove(self) -> None:
+        """Пометить профиль на удаление и закрыть окно — удаляет его агент."""
+        self.deleted = True
+        self.accept()
+
+    def _fill_from_preset(self) -> None:
+        """Подставить заготовку профиля — дальше её правят руками."""
+        item = self.preset.currentData() or {}
+        self._fill({
+            "name": item.get("name", ""),
+            "about": item.get("about", ""),
+            "style": item.get("style", config.PERSONA_STYLE),
+            "format": item.get("format", config.PERSONA_FORMAT),
+            "length": item.get("length", config.PERSONA_LENGTH),
+            "limits": item.get("limits") or [],
+            "prefs": [{"key": key, "value": value} for key, value in (item.get("prefs") or {}).items()],
+        })
+
+    def _fill(self, values: dict) -> None:
+        """Разложить профиль по полям окна (и свои ограничения — отдельно от флажков)."""
+        self.name.setText(values.get("name", ""))
+        self.about.setPlainText(values.get("about", ""))
+        for box, code in ((self.style, values.get("style")), (self.format, values.get("format")),
+                          (self.length, values.get("length"))):
+            box.setCurrentIndex(max(0, box.findData(code)))
+        limits = list(values.get("limits") or [])
+        for code, box in self.limit_boxes.items():
+            box.setChecked(code in limits)
+        self.own_limits.setPlainText("\n".join(item for item in limits if item not in self.limit_boxes))
+        self.prefs.setPlainText("\n".join(
+            f"{item.get('key')}: {item.get('value')}" for item in values.get("prefs") or []
+        ))
+
+    def values(self) -> dict:
+        """Профиль в том виде, в каком его примет агент (проверит он же)."""
+        limits = [code for code, box in self.limit_boxes.items() if box.isChecked()]
+        limits += [line.strip() for line in self.own_limits.toPlainText().splitlines() if line.strip()]
+        prefs = {}
+        for line in self.prefs.toPlainText().splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() and value.strip():
+                prefs[key.strip()] = value.strip()
+        return {
+            "name": self.name.text().strip() or "Профиль",
+            "about": self.about.toPlainText().strip(),
+            "style": self.style.currentData(),
+            "format": self.format.currentData(),
+            "length": self.length.currentData(),
+            "limits": limits,
+            "prefs": prefs,
+        }
+
+
 class NameDialog(QDialog):
     """Имя для новой ветки и место, от которого её вести.
 
@@ -1401,6 +1610,9 @@ class AgentWindow(QMainWindow):
         # Агенты приезжают из хранилища вместе с памятью и настройками: окно их
         # не собирает и не знает, что и в каком виде лежит на диске.
         self.store = Store()
+        # Профили поднимаются ДО агентов: агент при восстановлении ищет свой профиль
+        # по ссылке, и на первом запуске его ещё нужно завести из заготовок.
+        self.personas = load_personas(self.store)
         self.agents, self.agent = load_agents(self.store)
         self.busy = False
         self.worker: AskWorker | None = None
@@ -1492,6 +1704,36 @@ class AgentWindow(QMainWindow):
         edit.clicked.connect(self._edit_profile)
         card_lay.addWidget(edit, 0, Qt.AlignTop)
         lay.addWidget(card)
+
+        # Профиль пользователя — рядом с паспортом агента, потому что это его пара:
+        # там «кто отвечает», здесь «кому и как». Профиль подключается к каждому
+        # запросу, поэтому переключатель на виду, а не спрятан в отдельном окне.
+        lay.addWidget(_section("ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ"))
+        self.persona_box = QComboBox()
+        self.persona_box.setToolTip(
+            "Кто вы для агента и в какой форме просите отвечать: стиль, формат,\n"
+            "ограничения. Профиль уходит в каждый запрос отдельным блоком.\n"
+            "«Без профиля» — агент отвечает как умеет: удобно сравнить."
+        )
+        self.persona_box.currentIndexChanged.connect(self._on_persona)
+        lay.addWidget(self.persona_box)
+        self.persona_name = QLabel()
+        self.persona_name.setObjectName("personaName")
+        self.persona_name.setWordWrap(True)
+        lay.addWidget(self.persona_name)
+        self.persona_note = _wrapped("", "note")
+        lay.addWidget(self.persona_note)
+        persona_row = QHBoxLayout()
+        persona_row.setSpacing(8)
+        self.persona_edit_btn = _ghost("Изменить")
+        self.persona_edit_btn.setToolTip("Стиль, формат, длина и ограничения — правятся на месте")
+        self.persona_edit_btn.clicked.connect(self._edit_persona)
+        new_persona = _ghost("+ профиль")
+        new_persona.setToolTip("Завести второй профиль и сравнить ответы для разных людей")
+        new_persona.clicked.connect(self._create_persona)
+        persona_row.addWidget(self.persona_edit_btn, 1)
+        persona_row.addWidget(new_persona, 1)
+        lay.addLayout(persona_row)
 
         lay.addWidget(_section("МОДЕЛЬ"))
         self.model_box = QComboBox()
@@ -1897,12 +2139,24 @@ class AgentWindow(QMainWindow):
             "В память идёт только настоящий ответ."
         )
         self.compare_btn.clicked.connect(lambda: self._send(compare=True))
+        # Вторая ось сравнения — профиль: тот же вопрос и тот же контекст, но
+        # требования к ответу другие. Второй профиль выбирается меню на кнопке, а
+        # не ещё одним списком в панели: список профилей там уже есть.
+        self.persona_btn = _ghost("⇄ профили")
+        self.persona_btn.setFixedHeight(56)
+        self.persona_btn.setToolTip(
+            "Ответить на тот же вопрос дважды: текущим профилем и выбранным.\n"
+            "Контекст и память одинаковые, разница только в профиле — видно, что\n"
+            "персонализация меняет сам ответ. Стоит один дополнительный вызов модели."
+        )
+        self.persona_btn.clicked.connect(self._compare_personas)
         self.send_btn = QPushButton("Отправить")
         self.send_btn.setObjectName("send")
         self.send_btn.setFixedHeight(56)
         self.send_btn.setCursor(Qt.PointingHandCursor)
         self.send_btn.clicked.connect(lambda: self._send())
         comp_lay.addWidget(self.input, 1)
+        comp_lay.addWidget(self.persona_btn)
         comp_lay.addWidget(self.compare_btn)
         comp_lay.addWidget(self.send_btn)
         lay.addWidget(composer)
@@ -1968,6 +2222,36 @@ class AgentWindow(QMainWindow):
         self.context_bar.show_state(self.agent.tokens_state())
 
         self._loading = True
+        # Профиль пользователя: список общий для всех агентов, подключён — у каждого
+        # свой. Пункт «без профиля» стоит последним: это не профиль, а его отсутствие.
+        self.persona_box.clear()
+        for item in self.agent.personas():
+            self.persona_box.addItem(item["name"], item["id"])
+            self.persona_box.setItemData(self.persona_box.count() - 1, item["text"], Qt.ToolTipRole)
+        self.persona_box.addItem("— без профиля —", "")
+        self.persona_box.setCurrentIndex(max(0, self.persona_box.findData(p["persona_id"])))
+        who = p["persona"]
+        self.persona_edit_btn.setEnabled(bool(who))
+        if who:
+            self.persona_name.setText(f'<span style="color: {PERSONA}">■</span> {who["name"]}')
+            # По пункту на строку: в ширину панели состав одной строкой не влезает,
+            # и перенос рвёт пары «поле: значение» пополам — «длина:» остаётся на
+            # одной строке, «коротко» уезжает на следующую. Цена — отдельной строкой:
+            # это не часть состава.
+            self.persona_note.setText(
+                "\n".join(who["parts"])
+                + f"\nвес в запросе: {_num(p['persona_tokens'])} т., в каждом"
+            )
+            self.persona_note.setToolTip(who["text"])
+            self.persona_name.setToolTip(who["text"])
+        else:
+            self.persona_name.setText("профиль не подключён")
+            self.persona_note.setText(
+                "Форму ответа агент выбирает сам. Подключите профиль — и стиль, формат, "
+                "длина и ограничения станут вашими."
+            )
+            self.persona_note.setToolTip("")
+            self.persona_name.setToolTip("")
         self.model_box.setCurrentIndex(max(0, self.model_box.findData(p["model"])))
         self.temp.setValue(round(p["temperature"] * 100))
         self.temp_value.setText(f"{p['temperature']:.2f}")
@@ -2071,7 +2355,8 @@ class AgentWindow(QMainWindow):
         if t:
             b = t.breakdown
             error = f"{t.error_pct:+.1f}%" if t.error_pct is not None else "—"
-            summary = f" + суммаризация {_num(b.summary)}" if b.summary else ""
+            summary = (f" + профиль {_num(b.persona)}" if b.persona else "") + \
+                      (f" + суммаризация {_num(b.summary)}" if b.summary else "")
             layers = (f" + долговременная {_num(b.long)}" if b.long else "") + \
                      (f" + задача {_num(b.task)}" if b.task else "")
             outer.addWidget(_wrapped(
@@ -2091,6 +2376,9 @@ class AgentWindow(QMainWindow):
                  STRATEGY_COLORS.get(t.strategy, MUTED)),
                 (_compression_line(t), SUMMARY),
                 (_layers_line(t), TASK),
+                # Пятая строка — персонализация: какой профиль ушёл в запрос,
+                # во что обошёлся и сошёлся ли с ним ответ.
+                (_persona_line(t, reply.persona), PERSONA),
             ):
                 if not line:
                     continue
@@ -2106,6 +2394,18 @@ class AgentWindow(QMainWindow):
                                   + ". Ответ оставлен как есть: решать вам.", "meta")
                 broken.setStyleSheet(f"color: {ERR_TEXT}; font-size: 11px; background: transparent;")
                 outer.addWidget(broken)
+
+            # Расхождение с профилем — такой же факт, как нарушенный инвариант:
+            # требование ушло в запрос и всё равно не выполнено. Ответ не
+            # перегенерируется, но молчать об этом нельзя.
+            if reply.persona and reply.persona.broken:
+                missed = _wrapped(
+                    "⛔ ответ разошёлся с профилем — "
+                    + " · ".join(f"{check.label}: {check.detail}" for check in reply.persona.broken)
+                    + ". Ответ оставлен как есть.", "meta",
+                )
+                missed.setStyleSheet(f"color: {ERR_TEXT}; font-size: 11px; background: transparent;")
+                outer.addWidget(missed)
 
             trouble = []
             if t.trimmed_pairs:
@@ -2127,7 +2427,9 @@ class AgentWindow(QMainWindow):
 
     def _show_trace(self, reply: AgentReply) -> None:
         """План, шаги, сжатие истории и маршрутизация памяти — то, чего в чате не бывает."""
-        if not reply.plan and not reply.steps and not reply.compression and not reply.memory:
+        personal = reply.persona and (reply.persona.changes or reply.persona.rejected)
+        if (not reply.plan and not reply.steps and not reply.compression and not reply.memory
+                and not personal):
             return
         card = QFrame()
         card.setObjectName("trace")
@@ -2238,11 +2540,45 @@ class AgentWindow(QMainWindow):
                 refused.setWordWrap(True)
                 lay.addWidget(refused)
 
+        # Персонализация: что изменилось в профиле после этого обмена и кто это
+        # решил. Тем же блоком видно и отказы — значение не из реестра профиль не
+        # принимает, как автомат не принимает запрещённый переход.
+        if personal:
+            p = reply.persona
+            lay.addWidget(_trace_label("ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ"))
+            head = QLabel(
+                f"«{p.name}» · {len(p.changes)} правк(и) по разговору ≈ {_num(p.tokens)} т. в запросе"
+            )
+            head.setObjectName("personaHead")
+            head.setWordWrap(True)
+            lay.addWidget(head)
+            box = QFrame()
+            box.setObjectName("stepResult")
+            box_lay = QVBoxLayout(box)
+            box_lay.setContentsMargins(10, 7, 10, 8)
+            sign = {"add": "+", "change": "~", "keep": "=", "reject": "✕"}
+            lines = [f"{sign.get(change.action, '·')} {change.what} "
+                     f"({config.persona_source_label(change.source)})" for change in p.changes]
+            lines += [f"✕ {text}" for text in p.rejected]
+            text = QLabel(_clip("\n".join(lines), 900))
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            box_lay.addWidget(text)
+            lay.addWidget(box)
+
         self.chat.add(card, Qt.AlignLeft)
 
     def _show_shadow(self, reply: AgentReply) -> None:
-        """Теневой ответ «с полной историей» под настоящим: два ответа и два счёта рядом."""
+        """Теневой ответ под настоящим: два ответа и два счёта рядом.
+
+        Сравнений два — по контексту (полная история вместо стратегии) и по
+        профилю (тот же контекст, другие требования к ответу), и показываются они
+        по-разному: в первом случае интересна цена, во втором — сам ответ.
+        """
         s, t = reply.shadow, reply.tokens
+        if s.kind == "persona":
+            self._show_persona_shadow(reply)
+            return
         strategy = config.strategy_label(t.strategy).lower() if t else "стратегия"
         if t and t.summarize:
             strategy += " + суммаризация"
@@ -2287,6 +2623,50 @@ class AgentWindow(QMainWindow):
             )
             warning.setStyleSheet(f"color: {WARN}; font-size: 11px; background: transparent;")
             outer.addWidget(warning)
+        self.chat.add_row(row)
+
+    def _show_persona_shadow(self, reply: AgentReply) -> None:
+        """Ответ на тот же вопрос другим профилем — главная проверка задания.
+
+        Контекст, память и вопрос одинаковые, отличается только профиль: разницу в
+        двух ответах нечем объяснить, кроме персонализации.
+        """
+        s, t = reply.shadow, reply.tokens
+        mine = f"«{t.persona_name}»" if t and t.persona_name else "без профиля"
+        self.chat.add_system(
+            f"↓ тот же вопрос, но {s.label}: память, контекст и вопрос те же — отличается "
+            f"только профиль. Выше ответ для {mine}. Этот ответ в память не идёт."
+        )
+        self.chat.add_bubble(s.text, "shadow")
+
+        row = QWidget()
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(6, 0, 0, 4)
+        outer.setSpacing(2)
+        b = s.breakdown
+        cost = f" · {_money(s.cost_usd)}" if s.cost_usd is not None else ""
+        outer.addWidget(_wrapped(
+            f"{s.label}: запрос {_num(s.prompt_tokens)} т. = инструкция {_num(b.system)}"
+            + (f" + профиль {_num(b.persona)}" if b.persona else " (профиля нет)")
+            + f" + память {_num(b.memory)} + вопрос {_num(b.question)} · ответ "
+              f"{_num(s.completion_tokens)} т. · {s.elapsed_s} c{cost}",
+            "meta",
+        ))
+        # Второй ответ проверяем по ЕГО профилю: иначе сравнение было бы нечестным —
+        # у каждого профиля свои требования к длине и формату.
+        if s.checks:
+            broken = [check for check in s.checks if not check.ok]
+            line = _wrapped(
+                (f"{s.label}: не соблюдено — "
+                 + "; ".join(f"{check.label}: {check.detail}" for check in broken))
+                if broken else
+                f"{s.label}: соблюдён — " + ", ".join(check.detail for check in s.checks),
+                "meta",
+            )
+            line.setStyleSheet(
+                f"color: {ERR_TEXT if broken else PERSONA}; font-size: 11px; background: transparent;"
+            )
+            outer.addWidget(line)
         self.chat.add_row(row)
 
     # ------------------------------------------------------- несколько агентов --
@@ -2552,7 +2932,30 @@ class AgentWindow(QMainWindow):
 
     # --------------------------------------------------------------- действия --
 
-    def _send(self, compare: bool = False) -> None:
+    def _compare_personas(self) -> None:
+        """Спросить одно и то же двумя профилями: меню прямо на кнопке.
+
+        Отдельного окна выбора нет нарочно: профилей немного, а лишнее окно ради
+        одного списка — та самая лишняя сущность.
+        """
+        if self.busy or not self.input.toPlainText().strip():
+            self.chat.add_system("Напишите вопрос — и тогда его можно задать двумя профилями.")
+            return
+        menu = QMenu(self)
+        for item in self.agent.personas():
+            if item["id"] == self.agent.persona_id:
+                continue
+            menu.addAction(f"{item['name']} — {item['summary']}").setData(item["id"])
+        if self.agent.persona_id:
+            menu.addAction("— без профиля —").setData("")
+        if menu.isEmpty():
+            self.chat.add_system("Сравнивать не с чем: заведите второй профиль в панели.")
+            return
+        chosen = menu.exec(self.persona_btn.mapToGlobal(self.persona_btn.rect().topLeft()))
+        if chosen is not None:
+            self._send(compare_with=chosen.data())
+
+    def _send(self, compare: bool = False, compare_with: str | None = None) -> None:
         text = self.input.toPlainText().strip()
         if not text or self.busy:
             return
@@ -2563,7 +2966,12 @@ class AgentWindow(QMainWindow):
         self.busy = True
         self.send_btn.setEnabled(False)
         self.compare_btn.setEnabled(False)
-        self._set_status(WARN, "агент думает и сравнивает…" if compare else "агент думает…")
+        self.persona_btn.setEnabled(False)
+        self._set_status(WARN, (
+            "агент думает и сравнивает…" if compare else
+            "агент отвечает двумя профилями…" if compare_with is not None else
+            "агент думает…"
+        ))
         # Пока идёт обращение, в полосе видно, на каком этапе агент сейчас работает:
         # этап — это не украшение, а то, что прямо сейчас управляет его ответом.
         task = self.agent.passport()["task"]
@@ -2574,7 +2982,7 @@ class AgentWindow(QMainWindow):
             )
 
         # Пока обращение идёт, кнопки выключены — двух одновременных не бывает.
-        self.worker = AskWorker(self.agent, text, compare)
+        self.worker = AskWorker(self.agent, text, compare, compare_with)
         self.worker.done.connect(self._on_reply)
         self.worker.failed.connect(self._on_error)
         self.worker.progress.connect(self._on_progress)
@@ -2630,12 +3038,83 @@ class AgentWindow(QMainWindow):
         self.busy = False
         self.send_btn.setEnabled(True)
         self.compare_btn.setEnabled(True)
+        self.persona_btn.setEnabled(True)
         self._refresh()
         self.input.setFocus()
 
     def _on_model(self) -> None:
         if not self._loading:
             self._apply(model=self.model_box.currentData())
+
+    # ------------------------------------------------ профиль пользователя --
+
+    def _on_persona(self) -> None:
+        """Переключить профиль: память и история при этом не меняются."""
+        if self._loading:
+            return
+        try:
+            self.agent.use_persona(self.persona_box.currentData() or "")
+        except AgentError as e:
+            self.chat.add_bubble(str(e), "error")
+        who = self.agent.persona
+        self.chat.add_system(
+            f"↓ профиль пользователя: «{who.name}» — {who.summary()}. Дальше агент отвечает так."
+            if who else
+            "↓ профиль отключён: дальше агент отвечает без персонализации."
+        )
+        self._refresh()
+
+    def _edit_persona(self) -> None:
+        """Правка подключённого профиля — на месте, как и паспорт агента."""
+        current = self.agent.passport()["persona"]
+        if current is None:
+            self.chat.add_system("Профиль не подключён — выберите его в панели или заведите новый.")
+            return
+        dialog = PersonaDialog(self, current)
+        if not dialog.exec():
+            return
+        try:
+            if dialog.deleted:
+                self._drop_persona(current)
+            else:
+                self.agent.edit_persona(dialog.values())
+                self._sync_personas()
+        except AgentError as e:
+            self.chat.add_bubble(str(e), "error")
+        self._refresh()
+
+    def _drop_persona(self, who: dict) -> None:
+        """Удалить профиль и снять его со всех агентов, которые им пользовались."""
+        self.agent.remove_persona(who["id"])
+        for other in self.agents:
+            if other is not self.agent and other.persona_id == who["id"]:
+                other.use_persona("")
+        self.chat.add_system(
+            f"↓ профиль «{who['name']}» удалён. Агент отвечает без персонализации, "
+            "пока вы не выберете другой профиль."
+        )
+
+    def _create_persona(self) -> None:
+        """Завести второй профиль: с ним и сравниваются ответы «для разных людей»."""
+        dialog = PersonaDialog(self)
+        if not dialog.exec():
+            return
+        try:
+            self.agent.create_persona(dialog.values())
+        except AgentError as e:
+            self.chat.add_bubble(str(e), "error")
+        self._refresh()
+
+    def _sync_personas(self) -> None:
+        """Профиль общий, поэтому правку должны увидеть и остальные агенты.
+
+        Каждый держит свой объект профиля, и без этого обхода агент, открытый на
+        соседней вкладке, продолжил бы работать с прежним — а профиль в базе уже
+        другой.
+        """
+        for other in self.agents:
+            if other is not self.agent and other.persona_id == self.agent.persona_id:
+                other.use_persona(other.persona_id)
 
     def _apply(self, **settings) -> None:
         """Настройки проверяет сам агент — окно только показывает результат."""
@@ -2837,6 +3316,30 @@ def _history_table(agent: Agent, history: list[dict]) -> QPlainTextEdit:
         lines += ["", "-- РАБОЧАЯ ПАМЯТЬ: по строке на задачу. В запрос уходит только та, у которой",
                   "-- status = open; закрытые остаются архивом и контекст не занимают."]
 
+    people = agent.personas()
+    active = agent.passport()["persona_id"]
+    lines += [
+        "",
+        "sqlite> SELECT id, name, style, format, length, limits, prefs FROM personas ORDER BY rowid;",
+        "",
+        f"{'id':<10}  {'name':<16}  {'style':<9}  {'format':<8}  {'length':<7}  огранич./предпочт.",
+        f"{'-' * 10}  {'-' * 16}  {'-' * 9}  {'-' * 8}  {'-' * 7}  {'-' * 30}",
+    ]
+    for row in people:
+        mark = " ←" if row["id"] == active else ""
+        lines.append(
+            f"{row['id']:<10}  {_oneline(row['name'], 16):<16}  {row['style']:<9}  "
+            f"{row['format']:<8}  {row['length']:<7}  "
+            f"{len(row['limits'])} / {len(row['prefs'])}{mark}"
+        )
+    if not people:
+        lines.append("-- строк нет: профилей ещё не заводили")
+    else:
+        lines += ["", "-- ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ: единственная таблица без agent_id и branch — профиль",
+                  "-- описывает человека, а не разговор, поэтому переживает и смену агента, и",
+                  "-- «забыть разговор», и его можно отдать нескольким агентам. Стрелкой отмечен тот,",
+                  "-- что подключён к запросам этого агента (ссылка лежит в agents.persona)."]
+
     branches = agent.branches()
     lines += [
         "",
@@ -2908,9 +3411,33 @@ def _layers_page(state: dict, tasks: list[dict]) -> QWidget:
     note.setWordWrap(True)
     lay.addWidget(note)
 
-    lines = ["ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — профиль, решения, знания, инварианты",
-             f"{'вид':<12} {'источник':<14} {'обр.':>5}  ключ: значение",
-             f"{'-' * 12} {'-' * 14} {'-' * 5}  {'-' * 40}"]
+    # Профиль идёт первым и отдельно от слоёв: он лежит в своей таблице, не
+    # принадлежит ветке и отвечает не на «что агент помнит», а на «для кого он
+    # говорит». Смешать его со слоями значило бы сделать вид, что слоёв четыре.
+    who = state["persona"]
+    lines = ["ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ — персонализация поверх памяти (таблица personas, вне веток)"]
+    if who:
+        lines.append(f"профиль «{who['name']}» — {who['summary']}")
+        lines.append(f"вес в запросе: {_num(state['persona_tokens'])} т., и так в КАЖДОМ обращении")
+        lines += ["  " + line for line in who["text"].splitlines()]
+        if who["prefs"]:
+            lines.append("  источники значений:")
+            lines += [f"    {item['key']}: {item['value']} "
+                      f"({config.persona_source_label(item['source'])}"
+                      + (f", обращение {item['turn']}" if item["turn"] else "") + ")"
+                      for item in who["prefs"]]
+        checked = [config.limit_label(code) for code in who["checked"]]
+        asked = [code for code in who["limits"] if code not in who["checked"]]
+        lines.append(f"  проверяется кодом после ответа: длина, формат"
+                     + (f", {', '.join(checked)}" if checked else ""))
+        if asked:
+            lines.append(f"  только просьба в промпте: {'; '.join(asked)}")
+    else:
+        lines.append("-- профиль не подключён: форму ответа выбирает модель")
+
+    lines += ["", "ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — профиль, решения, знания, инварианты",
+              f"{'вид':<12} {'источник':<14} {'обр.':>5}  ключ: значение",
+              f"{'-' * 12} {'-' * 14} {'-' * 5}  {'-' * 40}"]
     notes = state["long"]["notes"]
     for item in notes:
         mark = ""
@@ -3010,6 +3537,24 @@ def _layers_line(t) -> str:
                 f"шаг {t.task_step} из {t.task_total}; в запрос ушли только части карточки, нужные "
                 f"этому этапу — {_num(t.breakdown.task)} т.")
     return "рабочая память: задачи нет — слой в запрос ничего не добавил"
+
+
+def _persona_line(t, update) -> str:
+    """Строка под ответом про персонализацию: чей профиль ушёл и соблюдён ли он.
+
+    Соблюдение показываем всегда, а не только при нарушении: иначе «агент учитывает
+    профиль» останется словами — а так под каждым ответом видно, что именно
+    проверено и с каким результатом.
+    """
+    if not t.persona_name:
+        return "профиль пользователя не подключён: форму ответа выбирает модель"
+    head = (f"профиль «{t.persona_name}» — {t.persona_summary} · "
+            f"вес в запросе: {_num(t.breakdown.persona)} т.")
+    if update is None or not update.checks:
+        return head
+    if update.broken:
+        return head + f" · соблюдено: {len(update.checks) - len(update.broken)} из {len(update.checks)}"
+    return head + " · соблюдён полностью: " + ", ".join(check.detail for check in update.checks)
 
 
 def _compression_line(t) -> str:
@@ -3169,6 +3714,32 @@ def _strategy_text(state: dict, rows: list[dict]) -> str:
     return f"Стратегия «{state['strategy_label']}» неизвестна этой версии интерфейса."
 
 
+def _persona_text(state: dict, rows: list[dict]) -> str:
+    """Раздел окна токенов: во что обходится персонализация и что в ней проверяется."""
+    who = state["persona"]
+    if not who:
+        return (
+            "Профиль пользователя не подключён: стиль, формат и длину ответа модель выбирает "
+            "сама, и проверять тут нечего. Подключите профиль в панели — форма ответа станет "
+            "вашей, а её соблюдение начнёт проверяться после каждого ответа."
+        )
+    spent = sum(row.get("persona_tokens") or 0 for row in rows)
+    turns = sum(1 for row in rows if row.get("persona_tokens"))
+    checked = [config.limit_label(code) for code in who["checked"]]
+    asked = [code for code in who["limits"] if code not in who["checked"]]
+    return (
+        f"Профиль «{who['name']}» — {who['summary']} — весит {_num(state['persona_tokens'])} токенов и "
+        f"уходит в КАЖДЫЙ запрос — за {turns} обращен(ий) это {_num(spent)} токенов. В отличие от "
+        "памяти, эта цена не растёт с разговором: профиль не накапливается.\n"
+        f"После ответа код сверяет с профилем длину (≈{who['length_words']} слов), формат "
+        f"«{who['format_label'].lower()}»"
+        + (f" и ограничения: {', '.join(checked)}" if checked else "")
+        + ". Расхождение видно строкой под ответом; ответ при этом не перегенерируется — решать вам."
+        + (f"\nОстальное уходит просьбой в инструкцию и кодом не проверяется: {'; '.join(asked)}."
+           if asked else "")
+    )
+
+
 def _compression_text(state: dict, rows: list[dict]) -> str:
     """Сжатие словами: что свёрнуто, во сколько обошлось сейчас и за всё время.
 
@@ -3211,14 +3782,14 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
     """Расход так, как он лежит в базе: строка таблицы `usage` — строка текста."""
     lines = [
         "sqlite> SELECT turn, strategy, llm_calls, prompt_tokens, completion_tokens, cost_usd, context_tokens,",
-        "               summary_tokens, long_tokens, task_tokens, folded_messages, dropped_messages,",
-        f"               estimated FROM usage WHERE agent_id = '{agent_id}' ORDER BY id;",
+        "               persona_tokens, summary_tokens, long_tokens, task_tokens, folded_messages,",
+        f"               dropped_messages, estimated FROM usage WHERE agent_id = '{agent_id}' ORDER BY id;",
         "",
         f"{'обр.':>5} {'стратегия':<12} {'выз.':>5} {'запрос':>8} {'ответ':>7} {'стоимость':>10} "
-        f"{'накоплено':>10} {'контекст':>9} {'суммаризация':>12} {'долгоср.':>8} {'задача':>6} "
-        f"{'вместо':>6} {'за окном':>8} {'оценка':>8} {'расх.':>7}",
-        f"{'-' * 5} {'-' * 12} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 12} "
-        f"{'-' * 8} {'-' * 6} {'-' * 6} {'-' * 8} {'-' * 8} {'-' * 7}",
+        f"{'накоплено':>10} {'контекст':>9} {'профиль':>8} {'суммаризация':>12} {'долгоср.':>8} "
+        f"{'задача':>6} {'вместо':>6} {'за окном':>8} {'оценка':>8} {'расх.':>7}",
+        f"{'-' * 5} {'-' * 12} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 8} "
+        f"{'-' * 12} {'-' * 8} {'-' * 6} {'-' * 6} {'-' * 8} {'-' * 8} {'-' * 7}",
     ]
     running = 0.0
     for row in rows:
@@ -3233,7 +3804,7 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
             f"{row['turn']:>5} {strategy:<12} "
             f"{row['llm_calls']:>5} {row['prompt_tokens']:>8} "
             f"{row['completion_tokens']:>7} {_money(row['cost_usd']):>10} {_money(running):>10} "
-            f"{actual:>9} {row.get('summary_tokens') or 0:>12} "
+            f"{actual:>9} {row.get('persona_tokens') or 0:>8} {row.get('summary_tokens') or 0:>12} "
             f"{row.get('long_tokens') or row.get('facts_tokens') or 0:>8} "
             f"{row.get('task_tokens') or 0:>6} "
             f"{row.get('folded_messages') or 0:>6} {row.get('dropped_messages') or 0:>8} "
@@ -3245,7 +3816,8 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
         lines += [
             "",
             "-- «запрос» и «ответ» — факт по всем вызовам обращения (план, шаги, итог, суммаризация,",
-            "-- маршрутизатор, теневой ответ), «контекст» — вес первого запроса, «суммаризация»,",
+            "-- маршрутизатор, теневой ответ), «контекст» — вес первого запроса, «профиль» — сколько",
+            "-- в нём занял профиль пользователя (он платится в каждом запросе), «суммаризация»,"
             "-- «долгоср.» и «задача» — сколько в нём заняли блоки слоёв памяти, «вместо» — скольких",
             "-- сообщений вместо суммаризация, «за окном» — сколько сообщений истории не ушло дословно,",
             "-- «оценка» — что счётчик обещал до отправки. «+сум» у стратегии — в этом обращении поверх",
