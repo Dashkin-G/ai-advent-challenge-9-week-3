@@ -426,6 +426,9 @@ class TokenReport:
     task_state: str = ""          # этап автомата, на котором шло обращение
     task_step: int = 0            # номер текущего шага плана
     task_total: int = 0           # всего шагов в плане
+    task_expect: str = ""         # ожидаемое действие: чей ход и чего ждут
+    task_paused: bool = False     # задача отложена: вместо карточки ушла закладка
+    task_resumed: bool = False    # это первый ответ после паузы
     pending_messages: int = 0     # ждут суммаризации
     pending_tokens: int = 0
     route_pending: int = 0        # ждут разбора маршрутизатором
@@ -639,6 +642,8 @@ class Agent:
     _live: "memory.MemoryUpdate" = field(default_factory=memory.MemoryUpdate, repr=False)
     _notify: object = field(default=_silent, repr=False)   # колбэк прогресса (см. ask)
     _state_before: str = field(default=config.AGENT_TASK_STATE, repr=False)  # этап на начало обращения
+    _resumed_before: bool = field(default=False, repr=False)  # обращение началось сразу после паузы
+    _rule_moves: int = field(default=0, repr=False)  # переходов по правилу за текущее обращение
     _branch: dict = field(default_factory=_main_branch, repr=False)  # описание активной ветки
 
     def __post_init__(self) -> None:
@@ -691,6 +696,10 @@ class Agent:
         # как есть», вернёт то же значение. Если к тому моменту код уже сдвинул этап
         # по факту работы, такой ответ — не просьба вернуться назад (см. _call_router).
         self._state_before = self._task.state if self._task else config.AGENT_TASK_STATE
+        # Первый ответ после паузы: пометку в инструкции снимет `_route`, когда она
+        # отработает, — а решение об этом принимается здесь, до сборки запроса.
+        self._resumed_before = bool(self._task is not None and self._task.resuming)
+        self._rule_moves = 0
         # Всё, что случилось с памятью по ходу обращения, копится здесь и достаётся
         # маршрутизатору уже заполненным: правила срабатывают не в конце, а сразу.
         self._live = memory.MemoryUpdate()
@@ -733,7 +742,9 @@ class Agent:
             working=self.working,
             long_version=self._long.version if long_block else 0,
             long_items=len(self._long.notes) if long_block else 0,
-            task_items=self._task.size() if task_block else 0,
+            # На паузе в запрос ушла закладка, а не карточка: пунктов в нём ноль,
+            # хотя сами пункты никуда не делись и вернутся вместе с задачей.
+            task_items=self._task.size() if task_block and not self._task.paused else 0,
             task_title=self._task.title if task_block else "",
             persona_id=self._persona.id if self._persona else "",
             persona_name=self._persona.name if self._persona else "",
@@ -742,6 +753,9 @@ class Agent:
             task_state=self._task.state if task_block else "",
             task_step=self._task.step if task_block else 0,
             task_total=self._task.total if task_block else 0,
+            task_expect=self._task.expect_line() if task_block else "",
+            task_paused=bool(task_block and self._task.paused),
+            task_resumed=self._resumed_before,
             pending_messages=len(self._pending_summary),
             pending_tokens=tokens.measure_messages(self._pending_summary, self.model),
             route_pending=len(self._pending_route),
@@ -1073,13 +1087,20 @@ class Agent:
         и смысл слоя — закончилась задача, и её данные перестают занимать контекст.
 
         В запрос уходит не вся карточка, а только части, нужные текущему этапу
-        (`config.state_sections`), плюс сам этап, номер шага и правило этапа. Это и
-        есть «инжектируй только нужное для текущего шага»: на планировании агенту
-        незачем видеть созданные файлы, на проверке — наоборот, нужны все.
+        (`config.state_sections`), плюс сам этап, номер шага, ожидаемое действие и
+        правило этапа. Это и есть «инжектируй только нужное для текущего шага»: на
+        планировании агенту незачем видеть созданные файлы, на проверке — наоборот,
+        нужны все.
+
+        На паузе вместо карточки уходит закладка в одну строку: дело отложено, и
+        платить за него контекстом в каждом сообщении незачем — но знать, что оно
+        есть, агент должен, иначе вернуться к нему сам он не предложит.
         """
         if not self.working or self._task is None or not self._task.open or not self._task:
             return ""
         task, state = self._task, self._task.state
+        if task.paused:
+            return memory.PAUSED_NOTE.format(bookmark=task.bookmark())
         return memory.TASK_NOTE.format(
             state=config.state_label(state),
             en=config.state_en(state),
@@ -1087,8 +1108,12 @@ class Agent:
             step=task.step,
             total=task.total,
             current=task.current_step(),
+            expect=task.expect_line() or "ход за вами",
             exit=config.state_exit(state) or "этап последний",
             task=task.text(config.state_sections(state)),
+            # Просьба продолжить с места стоит ровно одно обращение — то самое,
+            # которое идёт первым после паузы. Дальше продолжение уже не первое.
+            resume=memory.RESUME_NOTE if task.resuming else "",
             rule=config.state_rule(state),
         )
 
@@ -1298,6 +1323,8 @@ class Agent:
         """
         if not self.working or (not plan and not steps and self._task is None):
             return
+        if self._task is not None and self._task.paused:
+            return          # отложенная задача не обрастает работой, которая уже не про неё
         # Заводить карточку по плану стоит, только если план и правда про дело:
         # планировщик выдаёт один шаг и на «напомни, что ты знаешь», и от этого
         # заводилась пустая задача-призрак (поймано на живом прогоне). Один шаг —
@@ -1317,6 +1344,7 @@ class Agent:
         if self._task is None or not self._task.open:
             self._task = memory.Task(title=" ".join(hint.split())[:60], turn=turn or self.turns,
                                      at=time.time(), updated_at=time.time())
+            memory.refresh_expect(self._task)   # ожидаемое действие есть у задачи с первой секунды
         return self._task
 
     def _postprocess(self, content: str, steps: list[AgentStep]) -> str:
@@ -1586,6 +1614,18 @@ class Agent:
             # (поймано на живом прогоне и на скриншоте пользователя).
             self._apply_transition(self._task, memory.overdue_state(self._task), update,
                                    source="rule")
+            # Ожидаемое действие пересчитываем последним: этап и шаги к этому моменту
+            # окончательные. Уточнение маршрутизатора при этом не трогаем — оно
+            # конкретнее шаблона и относится к этому же обмену.
+            if not any(r.kind == "expect" and r.source == "router" for r in update.routes):
+                route = memory.refresh_expect(self._task)
+                if route is not None:
+                    update.routes.append(route)
+            if self._resumed_before and self._task.resuming:
+                # Просьба «продолжай с места» отработала в этом обращении. Не снять
+                # её здесь — и она висела бы в каждом следующем запросе, хотя
+                # продолжение давно не первое.
+                self._task.resuming = False
 
         if self._task is not None and not self._task.open and task_before and task_before["open"]:
             handed = memory.handoff(self._task, self._long, self.turns)
@@ -1687,6 +1727,16 @@ class Agent:
                 # на этап «Готово».
                 return True
             task = self._ensure_task(card.get("title", ""), turn=self.turns)
+            # Возврат к отложенному делу разбираем ПЕРВЫМ: пока стоит пауза, карточка
+            # заморожена, и всё, что маршрутизатор про неё насчитал, применять нельзя.
+            # Сняли паузу — дальше обращение идёт как обычное.
+            if card.get("paused") is False:
+                self._apply_pause(task, False, update)
+            if task.paused:
+                # Задача так и осталась отложенной: разговор идёт не про неё. Ни
+                # шагов, ни находок, ни переходов — иначе «пауза» была бы только
+                # словом в интерфейсе.
+                return True
             update.routes.extend(memory.merge_task(task, card, self.turns))
             # Сначала догоняем факт, и только потом слушаем совет. Иначе выходит так:
             # пользователь просит завершить, маршрутизатор возвращает done, а задача
@@ -1702,6 +1752,10 @@ class Agent:
                 # устаревшему совету гонял бы задачу туда-сюда между этапами.
                 wanted = ""
             self._apply_transition(task, wanted, update)
+            # Отложить просят последним: всё, что прозвучало в этом обмене, уже
+            # разложено по карточке — пауза замораживает её вместе с этим.
+            if card.get("paused") is True:
+                self._apply_pause(task, True, update)
         return True
 
     def _apply_transition(
@@ -1726,6 +1780,16 @@ class Agent:
         """
         if not wanted:
             return
+        if source == "rule" and self._rule_moves:
+            # Не больше одного перехода по правилу за обращение. Иначе выходит так:
+            # агент в первом же ответе составил план и записал файл, маршрутизатор
+            # сложил сделанное в шаги уже закрытыми — и задача, которая только
+            # началась, за один обмен уехала с планирования на проверку (поймано на
+            # скриншоте пользователя). Наблюдаемые признаки честны только по одному
+            # за раз: следующий шаг автомат сделает на следующем обращении.
+            logger.info("Агент «%s» [%s]: второй переход по правилу за обращение отложен (%s → %s)",
+                        self.profile.name, self.id, task.state, wanted)
+            return
         try:
             moved = memory.transition(task, wanted, self.turns)
         except memory.TransitionError as e:
@@ -1739,6 +1803,8 @@ class Agent:
         if not moved:
             return
         update.moved.append(moved)
+        if source == "rule":
+            self._rule_moves += 1
         update.routes.append(memory.Route(
             layer="working", action="change", kind="state", source=source, what=f"этап: {moved}",
         ))
@@ -1746,6 +1812,46 @@ class Agent:
         # по нему видно, чем агент занят прямо сейчас.
         self._notify("state", {"moved": moved, "source": source, "task": task.to_dict()})
         logger.info("Агент «%s» [%s]: этап задачи «%s» — %s (%s)",
+                    self.profile.name, self.id, task.title, moved,
+                    config.note_source_label(source))
+
+    def _apply_pause(
+        self,
+        task: "memory.Task",
+        wanted: bool | None,
+        update: memory.MemoryUpdate,
+        source: str = "router",
+    ) -> None:
+        """Отложить задачу или вернуться к ней по решению маршрутизатора.
+
+        `None` — «поле не упомянуто»: состояние паузы не меняется. Это не мелочь
+        разбора, а защита: обычное булево с умолчанием False снимало бы паузу на
+        каждом обращении, где модель про поле просто забыла, — а забывает она часто.
+
+        Пауза идёт тем же путём, что и переходы: через `memory.pause`/`resume`, с
+        записью в трассу и событием прогресса. Другого способа её поставить нет, и
+        поэтому по трассе всегда видно, кто отложил дело — человек или модель.
+        """
+        if wanted is None or bool(wanted) == task.paused:
+            return
+        try:
+            moved = (memory.pause(task, self.turns) if wanted
+                     else memory.resume(task, self.turns))
+        except memory.TransitionError as e:
+            update.rejected = str(e)
+            update.routes.append(memory.Route(
+                layer="working", action="reject", kind="pause", source=source,
+                what=("пауза отклонена" if wanted else "возврат к задаче отклонён"),
+            ))
+            return
+        if not moved:
+            return
+        update.paused = moved
+        update.routes.append(memory.Route(
+            layer="working", action="change", kind="pause", source=source, what=moved,
+        ))
+        self._notify("pause", {"moved": moved, "source": source, "task": task.to_dict()})
+        logger.info("Агент «%s» [%s]: задача «%s» — %s (%s)",
                     self.profile.name, self.id, task.title, moved,
                     config.note_source_label(source))
 
@@ -2242,6 +2348,48 @@ class Agent:
                     f" · в долговременную: {handed.what}" if handed else "")
         return {"task": card, "moved": moved, "handoff": handed.what if handed else ""}
 
+    def pause_task(self) -> dict:
+        """Отложить задачу: автомат замирает на текущем этапе.
+
+        Пауза возможна на любом этапе и этап не меняет — в этом и разница между
+        «отложили» и «вернулись назад». Пока она стоит, карточка уходит из запроса
+        (остаётся закладка в строку), правила рабочей памяти молчат, а любой
+        переход — хоть от модели, хоть от кнопки — получает отказ.
+        """
+        if self._task is None or not self._task.open:
+            raise AgentError("Открытой задачи нет — откладывать нечего.")
+        try:
+            moved = memory.pause(self._task, self.turns)
+        except memory.TransitionError as e:
+            raise AgentError(str(e)) from e
+        if not moved:
+            raise AgentError("Задача уже на паузе.")
+        self._persist_task()
+        logger.info("Агент «%s» [%s]: задача «%s» — %s",
+                    self.profile.name, self.id, self._task.title, moved)
+        return {"task": self._task.to_dict(), "moved": moved}
+
+    def resume_task(self) -> dict:
+        """Продолжить отложенную задачу с того же места.
+
+        Карточка возвращается в запрос целиком, а первым обращением после паузы в
+        инструкцию уходит прямая просьба продолжить с текущего шага и не
+        переспрашивать того, что уже записано, — это и есть «продолжение без
+        повторных объяснений».
+        """
+        if self._task is None or not self._task.open:
+            raise AgentError("Открытой задачи нет — продолжать нечего.")
+        try:
+            moved = memory.resume(self._task, self.turns)
+        except memory.TransitionError as e:
+            raise AgentError(str(e)) from e
+        if not moved:
+            raise AgentError("Задача не на паузе — она и так в работе.")
+        self._persist_task()
+        logger.info("Агент «%s» [%s]: задача «%s» — %s",
+                    self.profile.name, self.id, self._task.title, moved)
+        return {"task": self._task.to_dict(), "moved": moved}
+
     def _persist_task(self) -> None:
         """Записать карточку задачи и долговременную память вне обращения."""
         if self.store is None or self._task is None:
@@ -2271,6 +2419,12 @@ class Agent:
         stage = (f"этап «{config.state_label(task.state)}», шаг {task.step} из {task.total} · "
                  f"задача «{task.title}»: {task.size()} пункт(ов)"
                  if task is not None and task.open and task else "")
+        if task is not None and task.open and task and task.paused:
+            # На паузе состояние слоя описывает не карточку, а закладку: в запросе
+            # сейчас только она, и по весу это видно.
+            stage = (f"⏸ на паузе с обращения №{task.paused_turn} · этап "
+                     f"«{config.state_label(task.state)}», шаг {task.step} из {task.total} · "
+                     f"в запросе только закладка")
         kinds = ", ".join(f"{config.note_kind_label(kind)} {len(items)}"
                           for kind, items in self._long.by_kind().items())
         return [

@@ -60,7 +60,7 @@ from . import config
 
 logger = logging.getLogger("app.store")
 
-VERSION = 8  # версия схемы, хранится в PRAGMA user_version
+VERSION = 9  # версия схемы, хранится в PRAGMA user_version
 
 MAIN_BRANCH = 0  # основная ветка: строки в branches у неё нет, это просто «ветка 0»
 
@@ -215,6 +215,14 @@ TASK_COLUMNS = {
     # переходы вообще разрешены (см. config.TASK_TRANSITIONS).
     "state": "TEXT NOT NULL DEFAULT 'planning'",     # planning / execution / validation / done
     "current": "TEXT NOT NULL DEFAULT ''",
+    # Третий элемент состояния задачи: чего ждём дальше и от кого (agent / user).
+    "expect": "TEXT NOT NULL DEFAULT ''",
+    "expect_who": "TEXT NOT NULL DEFAULT ''",
+    # Пауза — состояние поверх этапа: задача отложена, этап сохраняется. `resuming`
+    # живёт одно обращение: по нему агент знает, что этот ответ — первый после паузы.
+    "paused": "INTEGER NOT NULL DEFAULT 0",
+    "paused_turn": "INTEGER NOT NULL DEFAULT 0",
+    "resuming": "INTEGER NOT NULL DEFAULT 0",
     "steps": "TEXT NOT NULL DEFAULT '[]'",           # JSON: [{"text": ..., "done": bool}]
     "findings": "TEXT NOT NULL DEFAULT '[]'",        # JSON: добытые факты и промежуточные результаты
     "artifacts": "TEXT NOT NULL DEFAULT '[]'",       # JSON: созданные файлы

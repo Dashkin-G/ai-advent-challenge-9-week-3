@@ -69,12 +69,33 @@ TASK_NOTE = (
     "переходы проверяет код агента, и запрещённый переход он просто отклонит, как бы убедительно ты "
     "его ни попросил. Считаешь, что этап пройден, — скажи об этом в ответе и верни нужный этап в "
     "поле state, а решение примет агент.\n"
+    "Состояние задачи — три строки ниже: ЭТАП (в какой фазе дело), ШАГ (где именно внутри плана) "
+    "и ЖДЁМ (что должно произойти дальше и от кого этого ждут). Ход твой — делай; ход "
+    "пользователя — скажи, чего ждёшь, и не топчись на месте.\n"
     "[ЭТАП] {state} ({en}) — {what}\n"
     "[ШАГ] {step} из {total}\n"
     "[СЕЙЧАС] {current}\n"
+    "[ЖДЁМ] {expect}\n"
     "[ДАЛЬШЕ] {exit}\n"
     "[ЗАДАЧА]\n{task}\n"
-    "{rule}"
+    "{resume}{rule}"
+)
+
+# Первый ответ после паузы. Строка живёт ровно одно обращение: дальше продолжение
+# уже не первое, и напоминание только занимало бы место.
+RESUME_NOTE = (
+    "ПРОДОЛЖЕНИЕ ПОСЛЕ ПАУЗЫ: это первый ответ после перерыва. Карточка выше — всё, на чём вы "
+    "остановились. Продолжай прямо с указанного шага: не пересказывай задачу заново, не "
+    "переспрашивай того, что уже записано, и не начинай с чистого листа.\n"
+)
+
+# Что уходит в запрос ВМЕСТО карточки, пока задача отложена. Дело на паузе не
+# должно занимать контекст в каждом сообщении, но и молчать о нём нельзя: иначе
+# агент про отложенное просто не знает и вернуться к нему не предложит.
+PAUSED_NOTE = (
+    "\n\nОтложенная задача: {bookmark}. Она на паузе: карточки сейчас нет в контексте, работу по "
+    "ней не продолжай и о её содержимом не догадывайся. Скажут «продолжаем» — карточка вернётся "
+    "целиком и работа пойдёт с того же шага."
 )
 
 # Инварианты — единственные записи памяти, которые проверяются кодом. В запрос они
@@ -101,6 +122,11 @@ ROUTER_SYSTEM = (
     "Новую карточку заводи, только если пользователь взялся за ДРУГОЕ дело. Уточнение, "
     "продолжение, доработка или проверка того же дела — это та же задача: сохрани её название "
     "и просто дополни шаги и находки.\n"
+    "ШАГИ — это план ПРЕДСТОЯЩЕЙ работы по задаче, а не отчёт о том, что агент успел сделать в "
+    "последнем ответе. Составил план и сохранил его в файл — это ещё не выполнение задачи: сам "
+    "план становится шагами, а «составить план» отдельным шагом не считается. Помечай шаг "
+    "выполненным, только когда сделана та работа, ради которой задача заведена, и об этом сказал "
+    "пользователь или это видно по результату инструмента.\n"
     "\n"
     "ЭТАП ЗАДАЧИ — конечный автомат, и ты в нём только советчик. Этапы:\n"
     "{states}\n"
@@ -108,18 +134,32 @@ ROUTER_SYSTEM = (
     "поле state тот этап, на котором задача должна оказаться после этого обмена. Запрещённый "
     "переход агент отклонит — не пытайся обойти это уговорами. Задача завершается только через "
     "этап done.\n"
+    "{pause}"
     "Когда двигать этап:\n"
     "  planning → execution: план назван, утверждён или пользователь просит приступать;\n"
     "  execution → validation: работа по плану сделана или пользователь просит проверить;\n"
     "  validation → done: проверка пройдена либо пользователь принял результат;\n"
     "  execution → planning: план оказался негодным и его надо переделать;\n"
-    "  validation → execution: проверка показала, что работа не доделана.\n"
+    "  validation → execution: проверка показала, что работа не доделана, ИЛИ пользователь просит "
+    "приступить к шагу, доделать или продолжить работу — это возврат к выполнению, а не "
+    "завершение.\n"
+    "Завершай задачу (done) только тогда, когда пользователь принял РЕЗУЛЬТАТ работы. Просьба "
+    "«приступай», «продолжай», «утверждаю план» — это движение вперёд по работе, а не её конец.\n"
     "Если пользователь прямо просит идти дальше — верни следующий этап, даже если у задачи "
     "остались открытые вопросы: незакрытый вопрос не повод стоять на месте, он просто переезжает "
     "в карточку. Стоять на том же этапе возвращай, только когда двигаться и правда рано.\n"
     "О том, что сделано в реальном мире, источник истины — пользователь: сказал, что шаг закрыт, "
     "ставь ему done, даже если агент в ответе усомнился. Проверить реальность ни ты, ни агент не "
     "можете.\n"
+    "\n"
+    "ПАУЗА — состояние поверх этапа, а не этап: задача откладывается целиком, этап и шаги при "
+    "этом сохраняются. Верни paused: true, когда пользователь просит отложить дело, переключается "
+    "на другое или говорит «вернёмся позже»; paused: false — когда просит продолжить отложенное "
+    "(«продолжаем», «вернёмся к ролику»). Поле не упомянул — состояние паузы не меняется.\n"
+    "ОЖИДАЕМОЕ ДЕЙСТВИЕ — expect: чей сейчас ход (who: agent, если дело за агентом, user, если "
+    "за пользователем) и чего ждут (what — одна короткая фраза). Базовое значение агент считает "
+    "сам по этапу и шагу; возвращай expect, только если из разговора видно что-то более "
+    "конкретное («пользователь пришлёт логотип», «ждём ответа от монтажёра»).\n"
     "\n"
     "ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — то, что переживёт эту задачу, записями «ключ: значение» четырёх видов:\n"
     "  profile — кто собеседник: имя, занятие, предпочтения, как с ним говорить;\n"
@@ -143,7 +183,8 @@ ROUTER_SYSTEM = (
     '{{"task": {{"status": "open|none", "state": "planning|execution|validation|done", '
     '"title": "...", "goal": "...", "current": "над чем работаем прямо сейчас", '
     '"steps": [{{"text": "...", "done": true}}], "findings": ["..."], "artifacts": ["..."], '
-    '"questions": ["..."]}}, '
+    '"questions": ["..."], "paused": false, '
+    '"expect": {{"who": "agent|user", "what": "чего ждём дальше"}}}}, '
     '"long": {{"profile": {{"ключ": "значение"}}, "decisions": {{}}, "knowledge": {{}}, '
     '"invariants": {{}}}}{schema}}}'
 )
@@ -255,6 +296,17 @@ class Task:
     (`config.state_sections`) и что агенту сейчас разрешено делать. Менять его
     напрямую нельзя — только через `transition()`, которая сверяется с таблицей
     разрешённых переходов.
+
+    Состояние задачи — это тройка «этап · текущий шаг · ожидаемое действие»:
+    `state` отвечает, в какой фазе дело; `step`/`current` — где именно внутри
+    плана; `expect`/`expect_who` — что должно произойти дальше и от кого этого
+    ждут. Третье поле не украшение: по нему видно, стоит ли дело из-за агента или
+    из-за человека, и оно же держит разговор после паузы.
+
+    `paused` — состояние ПОВЕРХ этапа, а не пятый этап: пауза возможна на любом
+    этапе, и этап при этом сохраняется. Пока она стоит, автомат заморожен
+    (`transition` откажет), карточка в запрос не уходит, а вместо неё едет
+    короткая закладка `bookmark()`.
     """
     id: int = 0
     title: str = ""
@@ -262,6 +314,11 @@ class Task:
     status: str = "open"                                   # open | done
     state: str = config.AGENT_TASK_STATE                   # этап автомата
     current: str = ""                                      # над чем работаем прямо сейчас
+    expect: str = ""                                       # ожидаемое действие: чего ждём
+    expect_who: str = ""                                   # от кого ждём: agent | user
+    paused: bool = False                                   # задача отложена, автомат заморожен
+    paused_turn: int = 0                                   # на каком обращении отложена
+    resuming: bool = False                                 # следующий ответ — первый после паузы
     steps: list[dict] = field(default_factory=list)        # [{"text": ..., "done": bool}]
     findings: list[str] = field(default_factory=list)      # добытые факты и промежуточные результаты
     artifacts: list[str] = field(default_factory=list)     # созданные файлы
@@ -325,6 +382,24 @@ class Task:
                 lines.extend(f"  - {value}" for value in values)
         return "\n".join(lines)
 
+    def expect_line(self) -> str:
+        """Ожидаемое действие одной строкой: чей ход и чего ждут."""
+        who = config.actor_label(self.expect_who)
+        return f"{who} — {self.expect}" if who and self.expect else self.expect
+
+    def bookmark(self) -> str:
+        """Закладка вместо карточки, пока задача на паузе.
+
+        Полная карточка на паузе в запрос не уходит: дело отложено, и платить за
+        него контекстом в каждом сообщении незачем. Но и молчать нельзя — иначе
+        агент про отложенное дело просто не знает и вернуться к нему не предложит.
+        Закладка — компромисс ценой в пару десятков токенов: чем занимались, на
+        каком этапе остановились и как продолжить.
+        """
+        where = (f"шаг {self.step} из {self.total}" if self.total else "плана ещё нет")
+        return (f"«{self.title or self.goal or 'без названия'}», этап "
+                f"«{config.state_label(self.state)}», {where}")
+
     def summary(self) -> str:
         """Одна строка про задачу — для перетока в долговременную память и для шапки."""
         done = sum(1 for step in self.steps if step.get("done"))
@@ -353,6 +428,14 @@ class Task:
             "current": self.current_step(),
             "step": self.step,
             "total": self.total,
+            "expect": self.expect,
+            "expect_who": self.expect_who,
+            "expect_who_label": config.actor_label(self.expect_who),
+            "expect_line": self.expect_line(),
+            "paused": self.paused,
+            "paused_turn": self.paused_turn,
+            "resuming": self.resuming,
+            "bookmark": self.bookmark(),
             "steps": [dict(step) for step in self.steps],
             "findings": list(self.findings),
             "artifacts": list(self.artifacts),
@@ -379,6 +462,11 @@ class Task:
             # остаться от другой версии реестра, и на нём автомат бы застрял.
             state=state if state in config.TASK_STATE_BY_CODE else config.AGENT_TASK_STATE,
             current=row.get("current") or "",
+            expect=row.get("expect") or "",
+            expect_who=row.get("expect_who") or "",
+            paused=bool(row.get("paused")),
+            paused_turn=int(row.get("paused_turn") or 0),
+            resuming=bool(row.get("resuming")),
             steps=[s for s in _load_list(row.get("steps")) if isinstance(s, dict)],
             findings=[str(v) for v in _load_list(row.get("findings"))],
             artifacts=[str(v) for v in _load_list(row.get("artifacts"))],
@@ -398,6 +486,11 @@ class Task:
             "status": self.status,
             "state": self.state,
             "current": self.current,
+            "expect": self.expect,
+            "expect_who": self.expect_who,
+            "paused": int(self.paused),
+            "paused_turn": self.paused_turn,
+            "resuming": int(self.resuming),
             "steps": json.dumps(self.steps, ensure_ascii=False),
             "findings": json.dumps(self.findings, ensure_ascii=False),
             "artifacts": json.dumps(self.artifacts, ensure_ascii=False),
@@ -437,6 +530,14 @@ def transition(task: Task, target: str, turn: int = 0) -> str:
         )
     if target == task.state:
         return ""
+    if task.paused:
+        # Пауза проверяется тем же кодом и тем же исключением, что и запрещённый
+        # переход: иначе «замороженный автомат» был бы просто просьбой в промпте, а
+        # модель (или кнопка) двигала бы этапы отложенной задачи как ни в чём не бывало.
+        raise TransitionError(
+            f"Задача на паузе ({task.bookmark()}): переход «{config.state_label(task.state)}» → "
+            f"«{config.state_label(target)}» не применён. Сначала продолжите работу."
+        )
     allowed = config.allowed_states(task.state)
     if target not in allowed:
         where = ", ".join(f"«{config.state_label(code)}»" for code in allowed) if allowed else "никуда"
@@ -455,6 +556,94 @@ def transition(task: Task, target: str, turn: int = 0) -> str:
     return f"{config.state_label(was)} → {config.state_label(target)}"
 
 
+def pause(task: Task, turn: int = 0) -> str:
+    """Отложить задачу: автомат замирает на текущем этапе.
+
+    Пауза — не этап и не возврат назад: этап, шаг и вся карточка остаются как
+    есть, замирает только движение. Поэтому она и возможна на любом этапе, а
+    «продолжить» не требует объяснять заново, чем занимались.
+
+    Возвращает описание события; пустая строка — задача уже была на паузе.
+    """
+    if not task.open:
+        raise TransitionError("Задача уже завершена — откладывать нечего.")
+    if task.paused:
+        return ""
+    task.paused = True
+    task.paused_turn = turn
+    task.resuming = False
+    task.updated_at = time.time()
+    refresh_expect(task)
+    return f"пауза на этапе «{config.state_label(task.state)}», шаг {task.step} из {task.total}"
+
+
+def resume(task: Task, turn: int = 0) -> str:
+    """Продолжить отложенную задачу с того же места.
+
+    `resuming` — пометка «следующий ответ первый после паузы»: по ней в инструкцию
+    попадает прямая просьба продолжить с текущего шага и не переспрашивать того,
+    что уже есть в карточке. Снимает её агент в конце обращения — иначе просьба
+    висела бы в каждом следующем запросе.
+    """
+    if not task.open:
+        raise TransitionError("Задача завершена — продолжать нечего.")
+    if not task.paused:
+        return ""
+    task.paused = False
+    task.resuming = True
+    task.updated_at = time.time()
+    refresh_expect(task)
+    return (f"продолжаем с этапа «{config.state_label(task.state)}», "
+            f"шаг {task.step} из {task.total}")
+
+
+def expected_action(task: Task) -> tuple[str, str]:
+    """Ожидаемое действие: чей ход и чего ждут. Правило в коде, без модели.
+
+    Ход у того, от кого зависит следующее движение автомата, а не у того, кто
+    последним говорил:
+
+        пауза              — ход человека: продолжить дело может только он;
+        планирование       — плана ещё нет, ход агента: предложить его; план есть,
+                             ход человека: утвердить или сказать «приступаем»;
+        выполнение         — есть незакрытый шаг, ход агента: сделать его;
+        проверка           — ход человека: подтвердить результат, потому что
+                             завершение — единственный переход, который код сам не
+                             делает никогда.
+    """
+    if not task.open:
+        return "", "задача завершена"
+    if task.paused:
+        return "user", config.TASK_PAUSE_EXPECT
+    if task.state == "planning":
+        who = "user" if task.steps else "agent"
+    elif task.state == "execution":
+        who = "agent" if any(not step.get("done") for step in task.steps) else "user"
+    else:
+        who = "user"
+    what = config.state_expect(task.state, who)
+    if who == "agent" and task.state == "execution" and task.total:
+        what = f"выполнить шаг {task.step} из {task.total}: {task.current_step()}"
+    return who, what
+
+
+def refresh_expect(task: Task) -> "Route | None":   # Route объявлен ниже — аннотация строкой
+    """Пересчитать ожидаемое действие по состоянию карточки.
+
+    Код пересчитывает его после каждого изменения задачи, поэтому поле никогда не
+    пустует — даже если маршрутизатор промолчал или ответил не тем форматом.
+    Уточнение от модели живёт до следующего пересчёта: наблюдаемый признак
+    (закрылся шаг, сменился этап) важнее формулировки, придуманной ход назад.
+    """
+    who, what = expected_action(task)
+    if (who, what) == (task.expect_who, task.expect):
+        return None
+    task.expect_who, task.expect = who, what
+    task.updated_at = time.time()
+    return Route(layer="working", action="change", kind="expect", source="rule",
+                 what=f"ждём: {task.expect_line()}")
+
+
 def overdue_state(task: Task) -> str:
     """Этап, до которого задача уже доросла по факту работы (пусто — не доросла).
 
@@ -471,8 +660,11 @@ def overdue_state(task: Task) -> str:
     А вот завершение (проверка → готово) код сам не делает никогда: «проверка
     прошла» — не наблюдаемый признак, и закрытая задача уходит из контекста. Это
     решение остаётся за маршрутизатором и за человеком.
+
+    На паузе правило молчит: отложенная задача не должна доезжать до следующего
+    этапа сама, пока человек не вернулся к делу.
     """
-    if not task.open:
+    if not task.open or task.paused:
         return ""
     if task.state == "planning":
         if any(step.get("done") for step in task.steps) or task.artifacts:
@@ -542,12 +734,14 @@ class MemoryUpdate:
     # выполнить его и дойти до проверки, пока пользователь ждёт один ответ. Хранить
     # только последний — значит скрыть половину пути, поэтому здесь список.
     moved: list[str] = field(default_factory=list)
+    paused: str = ""               # событие паузы за обращение: отложили или вернулись
     rejected: str = ""             # отклонённый переход: что попросила модель и почему нельзя
     elapsed_s: float = 0.0
     call_tokens: int = 0
 
     def __bool__(self) -> bool:
-        return bool(self.routes or self.task_action or self.moved or self.rejected)
+        return bool(self.routes or self.task_action or self.moved or self.paused
+                    or self.rejected)
 
     def by_layer(self, layer: str) -> list[Route]:
         return [route for route in self.routes if route.layer == layer]
@@ -564,6 +758,7 @@ class MemoryUpdate:
             "task_action": self.task_action,
             "called": self.called,
             "moved": list(self.moved),
+            "paused": self.paused,
             "rejected": self.rejected,
             "elapsed_s": self.elapsed_s,
             "call_tokens": self.call_tokens,
@@ -712,6 +907,8 @@ def apply_remember(
             raise ValueError("Для рабочей памяти kind — goal, step, finding, artifact или question.")
         if task is None:
             raise ValueError("Задачи сейчас нет: рабочую память некуда положить.")
+        if task.paused:
+            raise ValueError("Задача на паузе: её карточка заморожена, пока работу не продолжат.")
         label = WORKING_KINDS[kind]
         if kind == "goal":
             task.goal = value
@@ -780,15 +977,22 @@ def router_messages(
     )
     state = task.state if task is not None and task.open else config.AGENT_TASK_STATE
     allowed = config.allowed_states(state)
+    paused = task is not None and task.open and task.paused
     return [
         {"role": "system", "content": ROUTER_SYSTEM.format(
             name=name, limit=config.LONG_LIMIT, items=config.TASK_ITEMS_LIMIT,
             states=states_listing(), state=state,
             allowed=", ".join(allowed) if allowed else "никуда, задача завершена",
+            pause=("Задача СЕЙЧАС НА ПАУЗЕ: этап не двигай и карточку не переписывай. Просит "
+                   "продолжить — верни paused: false, и работа пойдёт с того же места.\n"
+                   if paused else ""),
             extra=(extra_rules + "\n") if extra_rules else "",
             schema=(", " + extra_schema) if extra_schema else "")},
         {"role": "user", "content": ROUTER_USER.format(
-            task=(f"этап {task.state}, шаг {task.step} из {task.total}\n" + task.text())
+            task=(f"этап {task.state}, шаг {task.step} из {task.total}"
+                  + (", НА ПАУЗЕ" if task.paused else "")
+                  + (f", ждём: {task.expect_line()}" if task.expect else "")
+                  + "\n" + task.text())
             if task is not None and task else "(задачи нет)",
             long=json.dumps(_long_payload(long), ensure_ascii=False) if long else "(пусто)",
             count=len(batch), messages=listing) + (f"\n\n{extra_input}" if extra_input else "")},
@@ -854,6 +1058,14 @@ def _parse_task(raw: object) -> dict | None:
     # самое, что переход на этап done, и отказ он получит по тем же правилам.
     if not wanted and status == "done":
         wanted = "done"
+    # Ожидаемое действие: объектом («кто» и «что») или просто строкой — модель
+    # возвращает и так, и так, а поле слишком полезное, чтобы терять его из-за формы.
+    raw_expect = raw.get("expect")
+    if isinstance(raw_expect, dict):
+        who = str(raw_expect.get("who") or "").strip().lower()
+        what = _clean(raw_expect.get("what") or raw_expect.get("action"), 160)
+    else:
+        who, what = "", _clean(raw_expect, 160)
     card = {
         "status": "open",
         "state": wanted if wanted in config.TASK_STATE_BY_CODE else "",
@@ -864,6 +1076,12 @@ def _parse_task(raw: object) -> dict | None:
         "findings": _clean_list(raw.get("findings")),
         "artifacts": _clean_list(raw.get("artifacts")),
         "questions": _clean_list(raw.get("questions")),
+        "expect": what,
+        "expect_who": who if who in config.TASK_ACTORS else "",
+        # Пауза — поле с тремя значениями: да, нет и «маршрутизатор о ней не сказал».
+        # Обычное булево с умолчанием False снимало бы паузу каждый раз, когда модель
+        # просто забыла упомянуть поле, — а забывает она часто.
+        "paused": _parse_flag(raw.get("paused")),
     }
     if not any(card[part] for part in
                ("title", "goal", "steps", "findings", "artifacts", "questions", "state")):
@@ -911,11 +1129,22 @@ def merge_task(task: Task, card: dict, turn: int) -> list[Route]:
 
     Этап здесь НЕ трогается: его двигает только `transition()` — иначе получилось
     бы второе место, где меняется состояние автомата, и таблица переходов перестала
-    бы что-либо гарантировать.
+    бы что-либо гарантировать. Пауза по той же причине применяется не здесь, а
+    через `pause()`/`resume()`.
+
+    А вот ожидаемое действие маршрутизатор уточнить может: базовое значение код
+    уже посчитал сам, и модель дописывает к нему конкретику из разговора, которой
+    в карточке не видно («пользователь пришлёт логотип»).
     """
     routes = []
     if card["current"] and card["current"] != task.current:
         task.current = card["current"]
+    if card.get("expect"):
+        who = card.get("expect_who") or task.expect_who
+        if (who, card["expect"]) != (task.expect_who, task.expect):
+            task.expect_who, task.expect = who, card["expect"]
+            routes.append(Route(layer="working", action="change", kind="expect", source="router",
+                                what=f"ждём: {task.expect_line()}"))
     if card["title"] and card["title"] != task.title:
         routes.append(Route(layer="working", action="change" if task.title else "add", kind="title",
                             source="router", what=f"название: {card['title']}"))
@@ -1050,7 +1279,12 @@ def rules_from_turn(task: Task, plan: list[str], steps: list) -> list[Route]:
     шагами задачи, выполненный инструмент — находкой, записанный файл — артефактом.
     По ним видно, что маршрутизация не сводится к «спросим модель»: часть выбора
     сделана в коде раз и навсегда.
+
+    На паузе правила молчат: отложенная задача не должна обрастать шагами и
+    находками из разговора, который идёт уже не про неё.
     """
+    if task.paused:
+        return []
     routes = []
     known = {step["text"] for step in task.steps}
     for item in plan:
@@ -1161,6 +1395,18 @@ def _trim_notes(long: LongTerm) -> None:
     """Удержать долговременную память в пределах потолка: лишнее с конца."""
     if len(long.notes) > config.LONG_LIMIT:
         long.notes = dict(list(long.notes.items())[:config.LONG_LIMIT])
+
+
+def _parse_flag(value: object) -> bool | None:
+    """Булево поле, которое умеет молчать: None — «не упомянуто, ничего не менять»."""
+    if isinstance(value, bool):
+        return value
+    text = str(value if value is not None else "").strip().lower()
+    if text in ("true", "yes", "да", "1", "on"):
+        return True
+    if text in ("false", "no", "нет", "0", "off"):
+        return False
+    return None
 
 
 def _clean(value: object, limit: int) -> str:

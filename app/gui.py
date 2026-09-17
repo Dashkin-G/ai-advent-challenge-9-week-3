@@ -282,11 +282,16 @@ QWidget#stateBarRow QLabel {{ background: transparent; }}
 QLabel#stateCaption {{ color: {TASK}; font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
 QLabel#stateArrow {{ color: {MUTED}; font-size: 13px; }}
 QLabel#stateProgress {{ color: {MUTED}; font-size: 11px; }}
+QLabel#stateExpect {{ color: {TASK}; font-size: 11px; }}
 QFrame#stateItem {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 8px; }}
 QFrame#stateItemActive {{ background: #2a1f12; border: 1px solid {TASK}; border-radius: 8px; }}
 QFrame#stateItemLocked {{ background: {BLACK}; border: 1px dashed {LINE}; border-radius: 8px; }}
+/* Этап, на котором задача замерла: подсвечен как текущий, но пунктиром — работа
+   стоит, а место в автомате сохранено. */
+QFrame#stateItemPaused {{ background: {BLACK}; border: 1px dashed {TASK}; border-radius: 8px; }}
 QFrame#stateItem QLabel, QFrame#stateItemActive QLabel {{ background: transparent; }}
 QFrame#stateItemLocked QLabel {{ background: transparent; color: {MUTED}; }}
+QFrame#stateItemPaused QLabel {{ background: transparent; color: {MUTED}; }}
 QLabel#stateItemName {{ font-size: 12px; font-weight: 600; }}
 QLabel#stateItemEn {{ color: {MUTED}; font-family: Consolas, monospace; font-size: 10px; }}
 QPushButton#example {{
@@ -652,8 +657,12 @@ class MemoryDialog(QDialog):
             blocks.append(f"долговременная №{long['version']}: {long['count']} зап. ≈ "
                           f"{_num(weight['long_tokens'])} т.")
         if weight["task_active"]:
-            blocks.append(f"задача «{weight['task']['title']}»: {weight['task']['size']} пункт(ов) ≈ "
-                          f"{_num(weight['task_tokens'])} т.")
+            blocks.append(
+                f"задача «{weight['task']['title']}» на паузе: закладка ≈ "
+                f"{_num(weight['task_tokens'])} т."
+                if weight["task"]["paused"] else
+                f"задача «{weight['task']['title']}»: {weight['task']['size']} пункт(ов) ≈ "
+                f"{_num(weight['task_tokens'])} т.")
         block = "".join(f" · {item}" for item in blocks)
         branch = f" · ветка «{weight['branch_name']}»" if weight["branch"] != MAIN_BRANCH else ""
         head = QLabel(
@@ -818,8 +827,12 @@ class ContextBar(QFrame):
             sent.append(f"долговременная №{state['long']['version']} ({state['long']['count']} зап. ≈ "
                         f"{_num(state['long_tokens'])} т.)")
         if state["task_active"]:
-            sent.append(f"задача «{state['task']['title']}» ({state['task']['size']} пункт(ов) ≈ "
-                        f"{_num(state['task_tokens'])} т.)")
+            sent.append(
+                f"закладка отложенной задачи «{state['task']['title']}» "
+                f"(≈ {_num(state['task_tokens'])} т.)"
+                if state["task"]["paused"] else
+                f"задача «{state['task']['title']}» ({state['task']['size']} пункт(ов) ≈ "
+                f"{_num(state['task_tokens'])} т.)")
         sent.append(f"{state['window_messages']} сообщ. как есть")
         parts.append("в модель: " + " + ".join(sent))
         if state["summarize"]:
@@ -837,6 +850,10 @@ class ContextBar(QFrame):
             parts.append("долговременная память пока пуста — появится после первого ответа")
         if state["working"] and not state["task_active"]:
             parts.append("задачи нет — рабочая память пуста")
+        if state["task_active"] and state["task"]["paused"]:
+            parts.append(f"задача отложена на этапе «{state['task']['state_label']}»: "
+                         f"{state['task']['size']} пункт(ов) карточки ждут в базе, "
+                         f"ждём: {state['task']['expect_line']}")
         if state["route_pending"]:
             parts.append(f"ждут маршрутизации: {state['route_pending']} сообщ.")
         self.history_line.setText(" · ".join(parts))
@@ -1173,6 +1190,39 @@ class BranchItem(QFrame):
         super().mousePressEvent(event)
 
 
+class ElidedLabel(QLabel):
+    """Однострочная подпись, которая всегда вписана в свою фактическую ширину.
+
+    Обычный QLabel в узкой полосе ведёт себя плохо: длинный текст либо распирает
+    строку и выдавливает соседей, либо молча обрезается по краю на полуслове. Здесь
+    полный текст хранится отдельно, а показывается ровно столько, сколько влезло, с
+    многоточием в конце — и пересчитывается сам, когда окно меняет размер.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.setObjectName(name)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._full = ""
+
+    def setFullText(self, text: str) -> None:
+        self._full = text
+        self._apply()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply()
+
+    def _apply(self) -> None:
+        # До первой раскладки ширина нулевая — берём разумную оценку, настоящую
+        # применит resizeEvent, как только полоса разложится.
+        room = self.width() if self.width() > 40 else 240
+        super().setText(self.fontMetrics().elidedText(self._full, Qt.ElideRight, room))
+
+
 class StateItem(QFrame):
     """Этап задачи в полосе автомата — индикатор, а не кнопка.
 
@@ -1183,14 +1233,17 @@ class StateItem(QFrame):
     задачу между этапами руками.
     """
 
-    def __init__(self, state: dict, active: bool, allowed: bool) -> None:
+    def __init__(self, state: dict, active: bool, allowed: bool, paused: bool = False) -> None:
         super().__init__()
-        self.setObjectName("stateItemActive" if active else
-                           ("stateItem" if allowed else "stateItemLocked"))
+        self.setObjectName(("stateItemPaused" if paused else "stateItemActive") if active else
+                           ("stateItem" if allowed and not paused else "stateItemLocked"))
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.setToolTip(
             f"{state['en']} — {state['what']}."
-            + ("\nЗадача здесь прямо сейчас." if active else
+            + ("\nЗадача остановлена здесь: пока стоит пауза, автомат заморожен и "
+               "любой переход отклоняется." if active and paused else
+               "\nЗадача здесь прямо сейчас." if active else
+               "\nЗадача на паузе: переходы заморожены, пока работу не продолжат." if paused else
                ("\nСледующий возможный этап — агент перейдёт сюда сам." if allowed else
                 "\nСюда из текущего этапа перейти нельзя: этапы нельзя перепрыгивать."))
         )
@@ -2035,10 +2088,17 @@ class AgentWindow(QMainWindow):
         # только пока задача открыта: нет задачи — нет и автомата.
         self.state_bar = QWidget()
         self.state_bar.setObjectName("stateBarRow")
-        self.state_bar.setFixedHeight(round(50 * self.scale))
-        state_row = QHBoxLayout(self.state_bar)
-        state_row.setContentsMargins(16, 0, 16, 0)
+        self.state_bar.setFixedHeight(round(78 * self.scale))
+        # Полоса в два ряда: сверху сам автомат (этапы и действия человека), снизу
+        # состояние задачи словами. В один ряд это не ставится: четыре чипа и две
+        # кнопки на масштабе 1.4 съедают всю ширину, и подписям остаются крохи.
+        state_box = QVBoxLayout(self.state_bar)
+        state_box.setContentsMargins(16, 4, 16, 4)
+        state_box.setSpacing(2)
+        state_row = QHBoxLayout()
+        state_row.setContentsMargins(0, 0, 0, 0)
         state_row.setSpacing(10)
+        state_box.addLayout(state_row)
         state_caption = QLabel("ЭТАП")
         state_caption.setObjectName("stateCaption")
         state_row.addWidget(state_caption)
@@ -2046,9 +2106,25 @@ class AgentWindow(QMainWindow):
         self.state_list.setContentsMargins(0, 0, 0, 0)
         self.state_list.setSpacing(6)
         state_row.addLayout(self.state_list)
-        self.state_progress = QLabel()
-        self.state_progress.setObjectName("stateProgress")
-        state_row.addWidget(self.state_progress, 1)
+        state_row.addStretch(1)
+        # Состояние задачи — три величины, и каждая подписана: этап чипами сверху,
+        # шаг и ожидаемое действие — двумя подписанными частями снизу. В одну строку
+        # без подписей они не ставятся: «шаг 2 из 4 · сверстать · агент» читалось бы
+        # как набор слов.
+        state_lines = QHBoxLayout()
+        state_lines.setContentsMargins(0, 0, 0, 0)
+        state_lines.setSpacing(14)
+        state_box.addLayout(state_lines)
+        # Обе подписи сами вписываются в свою долю ширины: полоса от них не растёт.
+        self.state_progress = ElidedLabel("stateProgress")
+        state_lines.addWidget(self.state_progress, 1)
+        self.state_expect = ElidedLabel("stateExpect")
+        state_lines.addWidget(self.state_expect, 1)
+        self.pause_btn = QPushButton("Пауза")
+        self.pause_btn.setObjectName("branchAction")
+        self.pause_btn.setCursor(Qt.PointingHandCursor)
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        state_row.addWidget(self.pause_btn)
         self.close_task_btn = QPushButton("Завершить задачу")
         self.close_task_btn.setObjectName("branchAction")
         self.close_task_btn.setCursor(Qt.PointingHandCursor)
@@ -2203,10 +2279,16 @@ class AgentWindow(QMainWindow):
         self.state_bar.setVisible(active_task)
         if active_task:
             self.task_line.setText(
-                f"⌛ {task['title'] or task['goal']} · {task['state_label'].lower()} · "
-                f"шаг {task['step']} из {task['total']}"
+                ("⏸ " if task["paused"] else "⌛ ")
+                + f"{task['title'] or task['goal']} · {task['state_label'].lower()} · "
+                + f"шаг {task['step']} из {task['total']}"
+                + (" · на паузе" if task["paused"] else "")
             )
-            self.task_line.setToolTip(task["text"])
+            self.task_line.setToolTip(
+                (f"Задача отложена на этапе «{task['state_label']}».\n"
+                 f"Ждём: {task['expect_line']}\n\n" if task["paused"] else
+                 f"Ждём: {task['expect_line']}\n\n") + task["text"]
+            )
             self._render_states(task)
         # Полоса веток нужна только в стратегии веток; в остальных ветка видна подписью.
         self.branch_bar.setVisible(p["strategy"] == "branches")
@@ -2503,13 +2585,16 @@ class AgentWindow(QMainWindow):
             lay.addWidget(_trace_label("МАРШРУТИЗАЦИЯ ПАМЯТИ"))
             how = (f"вызов модели {m.elapsed_s} c, {_num(m.call_tokens)} т."
                    if m.called else "без вызова модели — по правилам агента")
-            path = " → ".join(m.moved)
+            # Каждый переход приходит строкой «A → B», и склейка через « → » давала
+            # «A → B → B → C»: конец одного и начало следующего — один и тот же этап.
+            path = _states_path(m.moved)
             head = QLabel(
                 f"{len(m.routes)} запис(и) по слоям  ·  долговременная {m.long_items} зап. "
                 f"≈ {_num(m.long_tokens)} т.  ·  задача "
                 f"{(m.task_action or 'без изменений') if m.task else 'не заведена'}"
                 f"{f' ≈ {_num(m.task_tokens)} т.' if m.task_tokens else ''}"
                 + (f"  ·  этапы: {path}" if path else "")
+                + (f"  ·  {m.paused}" if m.paused else "")
                 + f"  ·  по {m.messages} сообщ.  ·  {how}"
             )
             head.setObjectName("taskHead")
@@ -2919,7 +3004,7 @@ class AgentWindow(QMainWindow):
         self.examples.setFixedHeight(round(52 * scale))
         self.agent_bar.setFixedHeight(round(52 * scale))
         self.branch_bar.setFixedHeight(round(46 * scale))
-        self.state_bar.setFixedHeight(round(50 * scale))
+        self.state_bar.setFixedHeight(round(78 * scale))
         self.dot.setFixedSize(round(9 * scale), round(9 * scale))
         self._set_status(self._status_color, self.status.text())
 
@@ -2976,7 +3061,10 @@ class AgentWindow(QMainWindow):
         # этап — это не украшение, а то, что прямо сейчас управляет его ответом.
         task = self.agent.passport()["task"]
         if self.agent.passport()["task_active"] and task:
-            self.state_progress.setText(
+            self._state_text(
+                progress=f"⏸ задача отложена на этапе «{task['state_label'].lower()}» — "
+                f"этот вопрос идёт мимо неё"
+                if task["paused"] else
                 f"⏳ агент работает на этапе «{task['state_label'].lower()}» · "
                 f"шаг {task['step']} из {task['total']}"
             )
@@ -2996,18 +3084,16 @@ class AgentWindow(QMainWindow):
         зритель видел готовый результат, но не видел движения.
         """
         if kind == "plan":
-            self.state_progress.setText(f"⏳ план из {len(data['steps'])} шагов составлен")
+            self._state_text(progress=f"⏳ план из {len(data['steps'])} шагов составлен")
             return
         if kind == "step":
-            self.state_progress.setText(
-                f"⏳ шаг {data['number']}: {data['tool']} · {data['title']}"
-            )
+            self._state_text(progress=f"⏳ шаг {data['number']}: {data['tool']} · {data['title']}")
             return
         if kind == "state":
             task = data["task"]
             # Полосу перекрашиваем сразу: этап сменился прямо сейчас, а не «по итогам».
             self._render_states(task)
-            self.state_progress.setText(f"⚙ {data['moved']} · шаг {task['step']} из {task['total']}")
+            self._state_text(progress=f"⚙ {data['moved']} · шаг {task['step']} из {task['total']}")
             self.task_line.setText(
                 f"⌛ {task['title'] or task['goal']} · {task['state_label'].lower()} · "
                 f"шаг {task['step']} из {task['total']}"
@@ -3016,6 +3102,16 @@ class AgentWindow(QMainWindow):
             self.task_line.show()
             self.chat.add_marker(
                 f"⚙ этап задачи: {data['moved']}  ·  {config.note_source_label(data['source'])}",
+                "stateMarker",
+            )
+            return
+        if kind == "pause":
+            # Отложить дело или вернуться к нему может и модель — по просьбе в
+            # разговоре. Событие то же самое, что от кнопки, и метка в ленте тоже.
+            task = data["task"]
+            self._render_states(task)
+            self.chat.add_marker(
+                f"⏸ {data['moved']}  ·  {config.note_source_label(data['source'])}",
                 "stateMarker",
             )
 
@@ -3138,15 +3234,21 @@ class AgentWindow(QMainWindow):
                 arrow.setObjectName("stateArrow")
                 self.state_list.addWidget(arrow)
             self.state_list.addWidget(
-                StateItem(state, state["code"] == task["state"], state["code"] in allowed)
+                StateItem(state, state["code"] == task["state"], state["code"] in allowed,
+                          bool(task.get("paused")))
             )
         # В строке — коротко, подробности в подсказке: `_clip` дописывает служебное
         # «…[ещё N символов]», и в полосе это выглядит как мусор (замечание
         # пользователя по скриншоту).
         exit_rule = config.state_exit(task["state"])
-        self.state_progress.setText(
-            f"шаг {task['step']} из {task['total']} · {_oneline(task['current'], 45)}"
-            + (f" · дальше: {exit_rule}" if exit_rule else " · это последний этап")
+        paused = bool(task.get("paused"))
+        self._state_text(
+            progress=f"шаг {task['step']} из {task['total']} · {_oneline(task['current'], 45)}"
+            + (f" · дальше: {exit_rule}" if exit_rule else " · это последний этап"),
+            # Номер обращения и объяснение паузы — в подсказке: в строке важнее всего,
+            # чьего хода ждут.
+            expect=(f"⏸ пауза · ждём: {_oneline(task['expect'], 44)}" if paused else
+                    f"ждём: {_oneline(task['expect_line'], 52)}"),
         )
         self.state_progress.setToolTip(
             f"Сейчас: {task['current']}\n"
@@ -3155,6 +3257,56 @@ class AgentWindow(QMainWindow):
               "маршрутизатор — по смыслу разговора, а порядок проверяет таблица\n"
               "переходов. Переключать этапы руками не нужно."
         )
+        # Третья величина состояния — ожидаемое действие. На паузе она же объясняет,
+        # почему ничего не происходит: ход за человеком, и до его слова автомат замер.
+        self.state_expect.setToolTip(
+            (f"Ждём: {task['expect_line']}\n\n"
+             f"Задача отложена на обращении {task['paused_turn']}: карточка ушла из запроса,\n"
+             "вместо неё едет закладка в одну строку, а любой переход по этапам\n"
+             "отклоняется — хоть от модели, хоть от кнопки, пока работу не продолжат."
+             if paused else
+             f"Ждём: {task['expect_line']}\n\n"
+             "Ожидаемое действие: что должно произойти дальше и от кого этого ждут.\n"
+             "Считает код по этапу и шагу, маршрутизатор может уточнить формулировку.")
+        )
+        self.pause_btn.setText("Продолжить" if paused else "Пауза")
+        self.pause_btn.setToolTip(
+            "Вернуться к отложенной задаче: карточка снова уйдёт в запрос целиком,\n"
+            "и агент продолжит с того же шага, не переспрашивая условий."
+            if paused else
+            "Отложить задачу на любом этапе. Этап и шаги сохранятся, автомат замрёт,\n"
+            "а карточка перестанет занимать контекст — останется закладка в строку."
+        )
+
+    def _state_text(self, progress: str | None = None, expect: str | None = None) -> None:
+        """Записать строки полосы этапов, вписав их в фактическую ширину.
+
+        Места здесь мало: чипы четырёх этапов и две кнопки съедают ширину. Подписи
+        вписываются в свою долю сами (`ElidedLabel`), а подробности остаются в
+        подсказке — обрезанная строка никогда не уносит с собой смысл целиком.
+        """
+        if progress is not None:
+            self.state_progress.setFullText(progress)
+        if expect is not None:
+            self.state_expect.setFullText(expect)
+
+    def _toggle_pause(self) -> None:
+        """Отложить задачу или вернуться к ней — второе действие человека в автомате.
+
+        Первое — «Завершить задачу». Больше кнопок у автомата нет: этапы он проходит
+        сам, и кликать по ним человеку не нужно. Пауза — исключение не потому, что
+        человек привилегирован, а потому, что «отложим до завтра» знает только он;
+        модель то же самое делает просьбой, и проходит она тем же кодом.
+        """
+        try:
+            task = self.agent.passport()["task"] or {}
+            result = (self.agent.resume_task() if task.get("paused")
+                      else self.agent.pause_task())
+        except AgentError as e:
+            self.chat.add_bubble(str(e), "error")
+            return
+        self.chat.add_marker(f"⏸ {result['moved']}  ·  решение человека", "stateMarker")
+        self._refresh()
 
     def _open_workspace(self) -> None:
         """Показать песочницу агента в проводнике: там лежит всё, что он записал."""
@@ -3299,22 +3451,27 @@ def _history_table(agent: Agent, history: list[dict]) -> QPlainTextEdit:
     tasks = agent.tasks()
     lines += [
         "",
-        "sqlite> SELECT id, status, title, turn, closed_turn, steps, findings, artifacts, questions",
+        "sqlite> SELECT id, status, state, paused, expect, title, turn, closed_turn, steps",
         f"        FROM tasks WHERE agent_id = '{agent_id}' AND branch = {branch} ORDER BY id;",
         "",
-        f"{'id':>4}  {'status':<7}  {'обр.':>4}  {'закр.':>5}  {'title':<22}  пункты",
-        f"{'-' * 4}  {'-' * 7}  {'-' * 4}  {'-' * 5}  {'-' * 22}  {'-' * 40}",
+        f"{'id':>4}  {'status':<7}  {'state':<11}  {'пауза':<6}  {'title':<20}  пункты",
+        f"{'-' * 4}  {'-' * 7}  {'-' * 11}  {'-' * 6}  {'-' * 20}  {'-' * 40}",
     ]
     for row in tasks:
         items = (f"шагов {len(row['steps'])}, находок {len(row['findings'])}, "
                  f"файлов {len(row['artifacts'])}, вопросов {len(row['questions'])}")
-        lines.append(f"{row['id']:>4}  {row['status']:<7}  {row['turn']:>4}  {row['closed_turn']:>5}  "
-                     f"{_oneline(row['title'], 22):<22}  {items}")
+        lines.append(f"{row['id']:>4}  {row['status']:<7}  {row['state']:<11}  "
+                     f"{('да' if row['paused'] else 'нет'):<6}  "
+                     f"{_oneline(row['title'], 20):<20}  {items}")
+        if row["open"]:
+            lines.append(f"      обращение {row['turn']}, ждём: {row['expect_line']}")
     if not tasks:
         lines.append("-- строк нет: задач не было")
     else:
         lines += ["", "-- РАБОЧАЯ ПАМЯТЬ: по строке на задачу. В запрос уходит только та, у которой",
-                  "-- status = open; закрытые остаются архивом и контекст не занимают."]
+                  "-- status = open; закрытые остаются архивом и контекст не занимают. Состояние",
+                  "-- задачи лежит колонками: state — этап автомата, expect/expect_who — ожидаемое",
+                  "-- действие, paused — отложена ли она (этап при этом сохраняется)."]
 
     people = agent.personas()
     active = agent.passport()["persona_id"]
@@ -3461,12 +3618,21 @@ def _layers_page(state: dict, tasks: list[dict]) -> QWidget:
     if open_task:
         allowed = ", ".join(config.state_label(code) for code in open_task["allowed"]) or "никуда"
         lines.append(f"открытая задача №{open_task['id']} · заведена на обращении {open_task['turn']}")
+        # Состояние задачи — три величины из задания, и каждая своей строкой: этап,
+        # текущий шаг, ожидаемое действие.
         lines.append(f"  этап: {open_task['state_label']} ({open_task['state_en']}) · "
                      f"шаг {open_task['step']} из {open_task['total']} · "
                      f"сейчас: {open_task['current']}")
-        lines.append(f"  разрешённые переходы: {allowed} — остальные код отклонит")
+        lines.append(f"  ожидаемое действие: {open_task['expect_line']}")
+        if open_task["paused"]:
+            lines.append(f"  ПАУЗА с обращения {open_task['paused_turn']}: автомат заморожен, "
+                         f"переходы отклоняются, в запрос уходит только закладка —")
+            lines.append(f"    {open_task['bookmark']}")
+        lines.append(f"  разрешённые переходы: {allowed} — остальные код отклонит"
+                     + (" (и все, пока стоит пауза)" if open_task["paused"] else ""))
         lines.append(f"  в запрос на этом этапе уходит: "
-                     f"{', '.join(config.state_sections(open_task['state'])) or '(ничего)'}")
+                     + ("(ничего, задача на паузе)" if open_task["paused"] else
+                        ', '.join(config.state_sections(open_task['state'])) or '(ничего)'))
         lines += ["  " + line for line in open_task["text"].splitlines()]
     else:
         lines.append("-- открытой задачи нет: в запрос ничего не уходит")
@@ -3524,6 +3690,21 @@ def _strategy_line(t, branch_name: str) -> str:
     return ""
 
 
+def _states_path(moved: list) -> str:
+    """Путь по этапам одной строкой: «Планирование → Выполнение → Проверка».
+
+    Переходы приходят по одному («A → B», «B → C»), и простая склейка повторяла
+    средний этап дважды. Здесь звенья сшиваются встык.
+    """
+    path: list[str] = []
+    for move in moved:
+        parts = [p.strip() for p in move.split("→")]
+        for part in parts:
+            if not path or path[-1] != part:
+                path.append(part)
+    return " → ".join(path)
+
+
 def _layers_line(t) -> str:
     """Строка под ответом про рабочую память: что за задача и во что она обходится.
 
@@ -3532,10 +3713,17 @@ def _layers_line(t) -> str:
     """
     if not t.working:
         return ""
+    if t.task_paused:
+        return (f"рабочая память: задача «{t.task_title}» отложена на этапе "
+                f"«{config.state_label(t.task_state)}» — карточка из запроса ушла, осталась "
+                f"закладка в строку ({_num(t.breakdown.task)} т.); ждём: {t.task_expect}")
     if t.task_items:
         return (f"рабочая память: задача «{t.task_title}» — этап «{config.state_label(t.task_state)}», "
                 f"шаг {t.task_step} из {t.task_total}; в запрос ушли только части карточки, нужные "
-                f"этому этапу — {_num(t.breakdown.task)} т.")
+                f"этому этапу — {_num(t.breakdown.task)} т."
+                + (f"; ждём: {t.task_expect}" if t.task_expect else "")
+                + ("; это первый ответ после паузы — карточка вернулась целиком"
+                   if t.task_resumed else ""))
     return "рабочая память: задачи нет — слой в запрос ничего не добавил"
 
 
