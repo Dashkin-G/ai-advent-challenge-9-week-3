@@ -60,7 +60,7 @@ from . import config
 
 logger = logging.getLogger("app.store")
 
-VERSION = 9  # версия схемы, хранится в PRAGMA user_version
+VERSION = 10  # версия схемы, хранится в PRAGMA user_version
 
 MAIN_BRANCH = 0  # основная ветка: строки в branches у неё нет, это просто «ветка 0»
 
@@ -145,6 +145,9 @@ USAGE_COLUMNS = {
     "task_items": "INTEGER NOT NULL DEFAULT 0",          # сколько пунктов было в карточке задачи
     "persona_tokens": "INTEGER NOT NULL DEFAULT 0",      # из контекста — профиль пользователя
     "persona": "TEXT NOT NULL DEFAULT ''",               # какой профиль был подключён
+    "invariant_tokens": "INTEGER NOT NULL DEFAULT 0",    # из контекста — свод нерушимых правил
+    "invariant_items": "INTEGER NOT NULL DEFAULT 0",     # сколько правил в нём было
+    "invariant_blocked": "INTEGER NOT NULL DEFAULT 0",   # ответ не дошёл до пользователя: нарушал правило
 }
 
 # Суммаризации: по строке на версию. Отдельная таблица, а не колонка в agents, потому
@@ -277,6 +280,24 @@ PERSONA_COLUMNS = {
     "updated_at": "REAL NOT NULL DEFAULT 0",
 }
 
+# Нерушимые правила проекта: по строке на правило. Как и профили, эта таблица без
+# `agent_id` и `branch` — и по той же причине, только сильнее: правило описывает не
+# человека и не разговор, а работу. Оно одно на всех агентов, переживает ветвление,
+# «забыть разговор» и удаление агента, который его записал. Запрещённые слова лежат
+# строкой JSON: список короткий, а отдельная таблица на слово превратила бы правку
+# правила в россыпь запросов.
+INVARIANT_COLUMNS = {
+    "id": "TEXT PRIMARY KEY",
+    "kind": "TEXT NOT NULL DEFAULT 'decision'",   # architecture / decision / stack / business
+    "title": "TEXT NOT NULL DEFAULT ''",          # короткое название, по нему правило и заменяется
+    "text": "TEXT NOT NULL DEFAULT ''",           # сама формулировка
+    "bans": "TEXT NOT NULL DEFAULT '[]'",         # JSON: слова, запрещённые в ответе
+    "source": "TEXT NOT NULL DEFAULT 'user'",     # user / router / tool
+    "turn": "INTEGER NOT NULL DEFAULT 0",         # на каком обращении правило появилось
+    "created_at": "REAL NOT NULL DEFAULT 0",
+    "updated_at": "REAL NOT NULL DEFAULT 0",
+}
+
 # Таблицы с внешним ключом на agents: удаление агента уносит их строки каскадом.
 TABLES = {
     "messages": MESSAGE_COLUMNS,
@@ -350,6 +371,7 @@ class Store:
     def _create_schema(self) -> None:
         agents = ", ".join(f"{name} {declaration}" for name, declaration in AGENT_COLUMNS.items())
         personas = ", ".join(f"{name} {declaration}" for name, declaration in PERSONA_COLUMNS.items())
+        rules = ", ".join(f"{name} {declaration}" for name, declaration in INVARIANT_COLUMNS.items())
         cascade = "FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE"
         with self._connect() as conn:
             conn.execute(f"CREATE TABLE IF NOT EXISTS agents ({agents})")
@@ -358,6 +380,10 @@ class Store:
             # иначе удаление агента уносило бы профиль его хозяина.
             conn.execute(f"CREATE TABLE IF NOT EXISTS personas ({personas})")
             self._add_new_columns(conn, "personas", PERSONA_COLUMNS)
+            # Свод правил — там же, где профили: каскада на агента у него нет, иначе
+            # удаление агента унесло бы правила всего проекта.
+            conn.execute(f"CREATE TABLE IF NOT EXISTS invariants ({rules})")
+            self._add_new_columns(conn, "invariants", INVARIANT_COLUMNS)
             for table, columns in TABLES.items():
                 declared = ", ".join(f"{name} {declaration}" for name, declaration in columns.items())
                 # Внешний ключ дописан отдельной строкой: ALTER TABLE его добавить не
@@ -400,6 +426,26 @@ class Store:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM personas ORDER BY created_at, rowid").fetchall()
         return [_persona(row) for row in rows]
+
+    def invariants(self) -> list[dict]:
+        """Свод нерушимых правил, в порядке появления. Общий для всех агентов."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM invariants ORDER BY created_at, rowid").fetchall()
+        return [_invariant(row) for row in rows]
+
+    def legacy_invariants(self) -> list[dict]:
+        """Записи долговременной памяти с видом «инвариант» — из базы дня 11.
+
+        Там правила лежали вместе с памятью о разговоре, по строке на ветку. Свод
+        поднимает их один раз, если своих строк у него ещё нет (см.
+        `Agent._load_invariants`), поэтому порядок здесь — от старых к новым: у
+        одинаковых ключей побеждает последняя запись.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM notes WHERE kind = 'invariant' ORDER BY id"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def persona(self, persona_id: str) -> dict | None:
         """Один профиль по ссылке из настроек агента (None — такого профиля нет)."""
@@ -576,6 +622,34 @@ class Store:
                 f"ON CONFLICT(id) DO UPDATE SET {updates}",
                 row,
             )
+
+    def save_invariant(self, rule: dict) -> None:
+        """Записать правило свода: новое или правку существующего.
+
+        Отдельной операцией, а не вместе с обращением: правило не принадлежит ни
+        разговору, ни ветке, и живёт дольше их обоих.
+        """
+        row = _invariant_row(rule)
+        columns = ", ".join(row)
+        marks = ", ".join(f":{name}" for name in row)
+        updates = ", ".join(f"{name} = excluded.{name}" for name in row
+                            if name not in ("id", "created_at"))
+        with self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO invariants ({columns}) VALUES ({marks}) "
+                f"ON CONFLICT(id) DO UPDATE SET {updates}",
+                row,
+            )
+
+    def save_invariants(self, rules: list[dict]) -> None:
+        """Записать весь свод разом — так его сохраняет окно правки."""
+        for rule in rules:
+            self.save_invariant(rule)
+
+    def remove_invariant(self, rule_id: str) -> None:
+        """Убрать правило из свода: снятая человеком рамка перестаёт действовать."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM invariants WHERE id = ?", (rule_id,))
 
     def remove_persona(self, persona_id: str) -> None:
         """Убрать профиль. Агенты, которые на него ссылались, останутся без профиля."""
@@ -999,6 +1073,37 @@ def _persona(row: sqlite3.Row) -> dict:
         "length": row["length"],
         "limits": _load_json(row["limits"], []),
         "prefs": _load_json(row["prefs"], []),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _invariant_row(rule: dict) -> dict:
+    """Правило → плоская строка таблицы `invariants`."""
+    now = time.time()
+    return {
+        "id": str(rule.get("id") or ""),
+        "kind": rule.get("kind") or "decision",
+        "title": rule.get("title") or "",
+        "text": rule.get("text") or "",
+        "bans": json.dumps(rule.get("bans") or [], ensure_ascii=False),
+        "source": rule.get("source") or "user",
+        "turn": int(rule.get("turn") or 0),
+        "created_at": float(rule.get("created_at") or now),
+        "updated_at": float(rule.get("updated_at") or now),
+    }
+
+
+def _invariant(row: sqlite3.Row) -> dict:
+    """Строка таблицы `invariants` → правило в том виде, в каком его отдал агент."""
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "title": row["title"],
+        "text": row["text"],
+        "bans": _load_json(row["bans"], []),
+        "source": row["source"],
+        "turn": row["turn"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

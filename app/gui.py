@@ -31,7 +31,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMenu, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QPlainTextEdit, QPushButton,
+    QRadioButton, QScrollArea,
     QSizePolicy, QSlider, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -64,6 +65,7 @@ FACTS = "#3fc9b8"     # долговременная память «ключ —
 TASK = "#f0a35e"      # рабочая память — карточка текущей задачи
 BRANCH = "#b48cff"    # ветки диалога и точки ветвления
 PERSONA = "#b7e26b"   # профиль пользователя: персонализация поверх памяти
+RULES = "#ff5964"     # нерушимые правила: цвет запрета, и он же цвет отказа по правилу
 
 # Цвет слоя памяти. Краткосрочная — цветом обычной памяти: это она и есть, только
 # названная по модели; у сжатой части внутри неё свой цвет (SUMMARY).
@@ -171,6 +173,15 @@ QLabel#summaryHead {{ color: {SUMMARY}; font-family: Consolas, monospace; font-s
 QLabel#factsHead {{ color: {FACTS}; font-family: Consolas, monospace; font-size: 12px; }}
 QLabel#taskHead {{ color: {TASK}; font-family: Consolas, monospace; font-size: 12px; }}
 QLabel#personaHead {{ color: {PERSONA}; font-family: Consolas, monospace; font-size: 12px; }}
+/* Нерушимые правила: блок в трассе и заголовок раздела в панели. */
+QLabel#ruleHead {{ color: {RULES}; font-family: Consolas, monospace; font-size: 12px; }}
+QLabel#ruleName {{ color: {RULES}; font-size: 13px; font-weight: 600; }}
+/* Метка срабатывания правила в ленте: её должно быть видно среди мета-строк —
+   отказ по правилу и есть главное событие дня. */
+QLabel#ruleMarker {{
+    color: {RULES}; font-size: 12px; font-weight: 700;
+    border: 1px solid {ERR_LINE}; border-radius: 8px; padding: 4px 10px;
+}}
 /* Профиль пользователя в панели: название и его состав второй строкой. */
 QLabel#personaName {{ color: {PERSONA}; font-size: 13px; font-weight: 600; }}
 /* Строка задачи в шапке: рабочая память видна там же, где имя агента. */
@@ -183,6 +194,13 @@ QLabel#stateMarker {{
     color: {TASK}; font-size: 12px; font-weight: 700;
     border: 1px solid {LINE}; border-radius: 8px; padding: 4px 10px;
 }}
+/* Свод правил в своём окне: список, в котором правило видно целиком. */
+QListWidget#rulesList {{
+    background: {CARD}; border: 1px solid {LINE}; border-radius: 10px;
+    padding: 6px; font-size: 12px; color: {TEXT};
+}}
+QListWidget#rulesList::item {{ padding: 6px 8px; border-radius: 6px; }}
+QListWidget#rulesList::item:selected {{ background: {ACCENT2}; color: {TEXT}; }}
 QFrame#stepResult {{ background: {BLACK}; border: 1px solid {LINE}; border-radius: 8px; }}
 QFrame#stepResult QLabel {{
     background: transparent; color: #a9c39a;
@@ -322,6 +340,7 @@ FIXED_PART = "#2f4a86"
 
 PART_COLORS = {
     "инструкция": "#7a5cff",
+    "инварианты": RULES,
     "профиль": PERSONA,
     "суммаризация": SUMMARY,
     "долговременная": FACTS,
@@ -818,6 +837,12 @@ class ContextBar(QFrame):
         sent = []
         # Профиль пользователя идёт первым: он определяет не содержание ответа, а
         # его форму, и платится в каждом запросе одинаково — в отличие от слоёв.
+        # Правила идут первыми: это рамки, в которых агент отвечает на всё
+        # остальное, и платятся они в каждом запросе, как и профиль.
+        if state["invariants_active"]:
+            book = state["invariants"]
+            sent.append(f"инварианты ({book['count']} прав., из них {book['checkable']} "
+                        f"проверяются ≈ {_num(state['invariants_tokens'])} т.)")
         if state["persona_active"]:
             sent.append(f"профиль «{state['persona']['name']}» ≈ {_num(state['persona_tokens'])} т.")
         if state["summary_active"]:
@@ -922,10 +947,13 @@ class UsageChart(QFrame):
             task = min(row.get("task_tokens") or 0, row["context_tokens"] - summary - long)
             who = min(row.get("persona_tokens") or 0,
                       row["context_tokens"] - summary - long - task)
+            law = min(row.get("invariant_tokens") or 0,
+                      row["context_tokens"] - summary - long - task - who)
             memory = min(row["memory_tokens"],
-                         row["context_tokens"] - summary - long - task - who)
+                         row["context_tokens"] - summary - long - task - who - law)
             blocks = (
-                (row["context_tokens"] - memory - summary - long - task - who, FIXED_PART),  # инструкция, схемы, вопрос
+                (row["context_tokens"] - memory - summary - long - task - who - law, FIXED_PART),
+                (law, PART_COLORS["инварианты"]),            # рамки работы: платятся всегда
                 (who, PART_COLORS["профиль"]),               # профиль пользователя: платится всегда
                 (summary, PART_COLORS["суммаризация"]),      # сжатое начало разговора
                 (long, PART_COLORS["долговременная"]),       # профиль, решения, знания
@@ -1073,6 +1101,14 @@ class TokensDialog(QDialog):
         history.setObjectName("subtitle")
         history.setWordWrap(True)
         lay.addWidget(history)
+
+        # Нерушимые правила: та же природа цены, что у профиля, но другой смысл —
+        # это не форма ответа, а границы допустимого.
+        lay.addWidget(_section("ИНВАРИАНТЫ: ЦЕНА И ПРОВЕРКА"))
+        rules_note = QLabel(_rules_text(state, rows))
+        rules_note.setObjectName("subtitle")
+        rules_note.setWordWrap(True)
+        lay.addWidget(rules_note)
 
         # Персонализация платится иначе, чем память: её вес не растёт с разговором,
         # зато взимается в каждом обращении — это стоит видеть отдельной строкой.
@@ -1549,6 +1585,213 @@ class PersonaDialog(QDialog):
         }
 
 
+class InvariantsDialog(QDialog):
+    """Свод нерушимых правил: что агенту нельзя, и по каким словам это проверяется.
+
+    Одно окно на весь свод, а не по окну на правило: правил несколько, и их удобнее
+    видеть списком, чем перебирать. Сверху — список по видам из задания, снизу —
+    форма выбранного правила. Выбрали строку — поля заполнились; «Сохранить»
+    правит на месте, «Новое правило» очищает форму, «Удалить» снимает рамку.
+
+    Поле «запрещённые слова» — это и есть граница между просьбой и правилом:
+    правило без него остаётся текстом в инструкции, которому модель может и не
+    последовать, а с ним ответ агента после генерации сверяется кодом.
+    """
+
+    def __init__(self, agent: Agent, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.agent = agent
+        self.setWindowTitle("Нерушимые правила проекта")
+        # Размер по масштабу интерфейса: на 1.4 фиксированные 640 px оставляли
+        # правилам ширину, в которую их формулировка уже не помещалась.
+        scale = getattr(parent, "scale", 1.0)
+        self.resize(round(640 * scale), round(660 * scale))
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        note = QLabel(
+            "Правила лежат отдельно от диалога — в своей таблице, не в памяти агента: они общие "
+            "для всех агентов, переживают ветвление, «забыть разговор» и перезапуск. Свод уходит "
+            "в каждый запрос отдельным блоком, а запрещённые слова проверяются дважды: в самом "
+            "вопросе (до ответа) и в готовом ответе (после). Нарушивший ответ до вас не дойдёт — "
+            "вместо него будет отказ."
+        )
+        note.setObjectName("note")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        lay.addWidget(_section("СВОД"))
+        self.list = QListWidget()
+        self.list.setObjectName("rulesList")
+        # Правило показывается целиком: перенос вместо горизонтальной прокрутки —
+        # формулировку нужно читать, а не прокручивать.
+        self.list.setWordWrap(True)
+        self.list.currentRowChanged.connect(self._select)
+        lay.addWidget(self.list, 1)
+
+        lay.addWidget(_section("ВИД ПРАВИЛА"))
+        self.kind = QComboBox()
+        for item in config.INVARIANT_KINDS:
+            self.kind.addItem(item["label"], item["code"])
+            self.kind.setItemData(self.kind.count() - 1,
+                                  f"{item['en']} · {item['what']}\nнапример: {item['example']}",
+                                  Qt.ToolTipRole)
+        self.kind.currentIndexChanged.connect(self._hint)
+        lay.addWidget(self.kind)
+
+        lay.addWidget(_section("НАЗВАНИЕ"))
+        self.title = QLineEdit()
+        self.title.setMaxLength(60)
+        self.title.setPlaceholderText("Коротко, до четырёх слов: «язык проекта»")
+        lay.addWidget(self.title)
+
+        lay.addWidget(_section("ПРАВИЛО"))
+        self.text = QPlainTextEdit()
+        self.text.setFixedHeight(64)
+        lay.addWidget(self.text)
+
+        lay.addWidget(_section("ЗАПРЕЩЁННЫЕ СЛОВА, ЧЕРЕЗ ЗАПЯТУЮ"))
+        self.bans = QLineEdit()
+        self.bans.setPlaceholderText("Kotlin, Java — по ним правило и проверяется")
+        self.bans.setToolTip(
+            "Слова, которых из-за этого правила не должно быть в ответе.\n"
+            "Есть слова — правило проверяется кодом: агент откажется и не пропустит\n"
+            "ответ с ними. Пусто — правило останется просьбой в инструкции."
+        )
+        lay.addWidget(self.bans)
+
+        self.hint = _wrapped("", "note")
+        lay.addWidget(self.hint)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        fresh = _ghost("Новое правило")
+        fresh.clicked.connect(self._fresh)
+        self.remove_btn = _ghost("Удалить")
+        self.remove_btn.setToolTip(
+            "Снять правило. Это единственный способ его отменить: разговором правило\n"
+            "не отменяется — так прямо сказано модели в своде."
+        )
+        self.remove_btn.clicked.connect(self._remove)
+        save = QPushButton("Сохранить правило")
+        save.setObjectName("send")
+        save.setFixedHeight(40)
+        save.setCursor(Qt.PointingHandCursor)
+        save.clicked.connect(self._save)
+        close = _ghost("Закрыть")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(fresh)
+        buttons.addWidget(self.remove_btn)
+        buttons.addWidget(close)
+        buttons.addWidget(save, 1)
+        lay.addLayout(buttons)
+
+        self.error = _wrapped("", "note")
+        self.error.setStyleSheet(f"color: {ERR_TEXT}; background: transparent;")
+        lay.addWidget(self.error)
+
+        self._render()
+        self._fresh()
+
+    # --- состояние окна ---
+
+    def _render(self) -> None:
+        """Перерисовать список правил: по строке на правило, с видом и проверяемостью."""
+        self.list.blockSignals(True)
+        self.list.clear()
+        for rule in self.agent.rules():
+            mark = "✓ проверяется" if rule["checkable"] else "— просьба"
+            item = QListWidgetItem(
+                f"[{rule['kind_label']}]  {rule['title']}: {rule['text']}   ·   {mark}"
+            )
+            item.setData(Qt.UserRole, rule["id"])
+            item.setToolTip(
+                f"{rule['kind_label']} ({rule['kind_en']})\n{rule['title']}: {rule['text']}\n"
+                + (f"запрещено в ответе: {', '.join(rule['bans'])}\n" if rule["bans"]
+                   else "запрещённых слов нет — правило остаётся просьбой в инструкции\n")
+                + f"внёс: {rule['source_label']}"
+                + (f", обращение {rule['turn']}" if rule["turn"] else "")
+            )
+            self.list.addItem(item)
+        if not self.agent.rules():
+            empty = QListWidgetItem("правил пока нет — заполните форму ниже и нажмите «Сохранить правило»")
+            empty.setFlags(Qt.NoItemFlags)
+            self.list.addItem(empty)
+        self.list.blockSignals(False)
+
+    def _fresh(self) -> None:
+        """Очистить форму под новое правило и подсказать пример его вида."""
+        self.current = ""
+        self.list.clearSelection()
+        self.title.clear()
+        self.text.setPlainText("")
+        self.bans.clear()
+        self.remove_btn.setEnabled(False)
+        self.error.setText("")
+        self._hint()
+        self.title.setFocus()
+
+    def _select(self, row: int) -> None:
+        """Показать выбранное правило в форме — правка идёт на месте, а не заново."""
+        item = self.list.item(row)
+        rule_id = item.data(Qt.UserRole) if item is not None else None
+        if not rule_id:
+            return
+        rule = next((r for r in self.agent.rules() if r["id"] == rule_id), None)
+        if rule is None:
+            return
+        self.current = rule_id
+        self.kind.setCurrentIndex(max(0, self.kind.findData(rule["kind"])))
+        self.title.setText(rule["title"])
+        self.text.setPlainText(rule["text"])
+        self.bans.setText(", ".join(rule["bans"]))
+        self.remove_btn.setEnabled(True)
+        self.error.setText("")
+        self._hint()
+
+    def _hint(self) -> None:
+        """Подсказка под формой: что это за вид правила и как он проверяется."""
+        item = config.INVARIANT_KIND_BY_CODE.get(self.kind.currentData() or "", {})
+        example = item.get("example", "")
+        self.hint.setText(
+            f"{item.get('what', '')}\nнапример: {example}"
+            + ("\nзапрещённые слова заданы — ответ будет сверяться с ними"
+               if self.bans.text().strip() else
+               "\nбез запрещённых слов правило останется просьбой в инструкции")
+        )
+
+    # --- действия ---
+
+    def _save(self) -> None:
+        """Записать правило: проверки делает агент, окно только показывает отказ."""
+        try:
+            self.agent.edit_rule({
+                "id": self.current,
+                "kind": self.kind.currentData(),
+                "title": self.title.text(),
+                "text": self.text.toPlainText(),
+                "bans": self.bans.text(),
+            })
+        except AgentError as e:
+            self.error.setText(str(e))
+            return
+        self._render()
+        self._fresh()
+
+    def _remove(self) -> None:
+        """Снять правило со свода — рамка перестаёт действовать сразу."""
+        if not self.current:
+            return
+        try:
+            self.agent.remove_rule(self.current)
+        except AgentError as e:
+            self.error.setText(str(e))
+            return
+        self._render()
+        self._fresh()
+
+
 class NameDialog(QDialog):
     """Имя для новой ветки и место, от которого её вести.
 
@@ -1787,6 +2030,26 @@ class AgentWindow(QMainWindow):
         persona_row.addWidget(self.persona_edit_btn, 1)
         persona_row.addWidget(new_persona, 1)
         lay.addLayout(persona_row)
+
+        # Нерушимые правила — третья сущность рядом с паспортом и профилем: не «что
+        # агент помнит» и не «для кого говорит», а «чего он не сделает никогда». Свод
+        # общий для всех агентов и лежит вне веток, поэтому стоит выше настроек
+        # конкретного агента — рядом с профилем, у которого та же природа.
+        lay.addWidget(_section("ИНВАРИАНТЫ"))
+        self.rules_name = QLabel()
+        self.rules_name.setObjectName("ruleName")
+        self.rules_name.setWordWrap(True)
+        lay.addWidget(self.rules_name)
+        self.rules_note = _wrapped("", "note")
+        lay.addWidget(self.rules_note)
+        rules_btn = _ghost("Свод правил")
+        rules_btn.setToolTip(
+            "Правила, которые агент не имеет права нарушать: архитектура, технические\n"
+            "решения, ограничения по стеку, бизнес-правила. Они лежат отдельно от\n"
+            "диалога, уходят в каждый запрос и проверяются кодом до и после ответа."
+        )
+        rules_btn.clicked.connect(self._edit_rules)
+        lay.addWidget(rules_btn)
 
         lay.addWidget(_section("МОДЕЛЬ"))
         self.model_box = QComboBox()
@@ -2334,6 +2597,33 @@ class AgentWindow(QMainWindow):
             )
             self.persona_note.setToolTip("")
             self.persona_name.setToolTip("")
+        # Свод правил: число, проверяемость и цена — по пункту на строку, как у
+        # профиля. Вес отдельной строкой: это не часть состава, а цена.
+        book = p["invariants"]
+        if book["count"]:
+            self.rules_name.setText(
+                f'<span style="color: {RULES}">■</span> '
+                + _plural(book["count"], "правило", "правила", "правил")
+            )
+            kinds = "\n".join(
+                f"{config.invariant_kind_label(kind).lower()}: {len(items)}"
+                for kind, items in book["by_kind"].items()
+            )
+            self.rules_note.setText(
+                kinds
+                + f"\nпроверяются кодом: {book['checkable']} из {book['count']}"
+                + f"\nвес в запросе: {_num(p['invariants_tokens'])} т., в каждом"
+            )
+            self.rules_note.setToolTip(book["text"])
+            self.rules_name.setToolTip(book["text"])
+        else:
+            self.rules_name.setText("правил нет")
+            self.rules_note.setText(
+                "Агент ничем не ограничен. Задайте правило — и он будет отказываться от "
+                "решений, которые его нарушают."
+            )
+            self.rules_note.setToolTip("")
+            self.rules_name.setToolTip("")
         self.model_box.setCurrentIndex(max(0, self.model_box.findData(p["model"])))
         self.temp.setValue(round(p["temperature"] * 100))
         self.temp_value.setText(f"{p['temperature']:.2f}")
@@ -2461,6 +2751,10 @@ class AgentWindow(QMainWindow):
                 # Пятая строка — персонализация: какой профиль ушёл в запрос,
                 # во что обошёлся и сошёлся ли с ним ответ.
                 (_persona_line(t, reply.persona), PERSONA),
+                # Шестая — нерушимые правила: сколько их, во что обошлись и чем
+                # кончилась сверка. Она есть в каждом ответе, пока свод не пуст:
+                # правило действует всегда, а не только когда сработало.
+                (_rules_line(reply.guard), RULES),
             ):
                 if not line:
                     continue
@@ -2468,12 +2762,13 @@ class AgentWindow(QMainWindow):
                 label.setStyleSheet(f"color: {color}; font-size: 11px; background: transparent;")
                 outer.addWidget(label)
 
-            # Нарушённый инвариант — не предупреждение «на всякий случай», а факт:
-            # правило записано в памяти, ушло в запрос и всё равно нарушено. Молчать
-            # об этом нельзя, иначе инвариант так и останется просьбой.
-            if reply.violations:
-                broken = _wrapped("⛔ нарушены инварианты — " + " · ".join(reply.violations)
-                                  + ". Ответ оставлен как есть: решать вам.", "meta")
+            # Срабатывание правила — главное событие дня, и оно не «предупреждение
+            # на всякий случай»: в двух случаях из трёх ответ модели сюда вообще не
+            # дошёл. Об этом нужно сказать прямо, иначе разницы между просьбой в
+            # промпте и правилом на экране не видно.
+            alarm = _rules_alarm(reply.guard)
+            if alarm:
+                broken = _wrapped(alarm, "meta")
                 broken.setStyleSheet(f"color: {ERR_TEXT}; font-size: 11px; background: transparent;")
                 outer.addWidget(broken)
 
@@ -2510,8 +2805,12 @@ class AgentWindow(QMainWindow):
     def _show_trace(self, reply: AgentReply) -> None:
         """План, шаги, сжатие истории и маршрутизация памяти — то, чего в чате не бывает."""
         personal = reply.persona and (reply.persona.changes or reply.persona.rejected)
+        # Блок правил показываем не всегда: пока ничего не сработало и свод не менялся,
+        # достаточно строки под ответом — иначе трасса заросла бы «нарушений нет».
+        lawful = reply.guard and (reply.guard.conflicts or reply.guard.broken
+                                  or reply.guard.changes or reply.guard.rejected)
         if (not reply.plan and not reply.steps and not reply.compression and not reply.memory
-                and not personal):
+                and not personal and not lawful):
             return
         card = QFrame()
         card.setObjectName("trace")
@@ -2646,6 +2945,41 @@ class AgentWindow(QMainWindow):
                      f"({config.persona_source_label(change.source)})" for change in p.changes]
             lines += [f"✕ {text}" for text in p.rejected]
             text = QLabel(_clip("\n".join(lines), 900))
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            box_lay.addWidget(text)
+            lay.addWidget(box)
+
+        # Нерушимые правила: два рубежа и свод. Здесь видно и то, что сработало, и
+        # то, что после этого стало с ответом, — а не только «нарушено».
+        if lawful:
+            g = reply.guard
+            lay.addWidget(_trace_label("ИНВАРИАНТЫ"))
+            head = QLabel(
+                f"{g.rules} правил(о) ≈ {_num(g.tokens)} т. в запросе  ·  проверяются кодом "
+                f"{g.checkable}  ·  итог: {g.verdict()}"
+            )
+            head.setObjectName("ruleHead")
+            head.setWordWrap(True)
+            lay.addWidget(head)
+            box = QFrame()
+            box.setObjectName("stepResult")
+            box_lay = QVBoxLayout(box)
+            box_lay.setContentsMargins(10, 7, 10, 8)
+            lines = [f"⛔ [рубеж 1 · запрос] {item.what()}" for item in g.conflicts]
+            lines += [f"⛔ [рубеж 2 · ответ] {item.what()}" for item in g.broken]
+            if g.redone and not g.blocked:
+                lines.append("↻ ответ переписан по указанию кода и проверку прошёл")
+            if g.blocked:
+                lines.append("✕ ответ заблокирован: пользователь получил отказ, а не текст модели")
+                if g.dropped:
+                    lines.append(f"  спрятано: {_clip(g.dropped, 200)}")
+            sign = {"add": "+", "change": "~", "remove": "−", "reject": "✕"}
+            lines += [f"{sign.get(change.action, '·')} [{config.invariant_kind_label(change.kind).lower()}] "
+                      f"{change.what} ({config.invariant_source_label(change.source)})"
+                      for change in g.changes]
+            lines += [f"✕ {text}" for text in g.rejected]
+            text = QLabel(_clip("\n".join(lines), 1200))
             text.setWordWrap(True)
             text.setTextInteractionFlags(Qt.TextSelectableByMouse)
             box_lay.addWidget(text)
@@ -3105,6 +3439,17 @@ class AgentWindow(QMainWindow):
                 "stateMarker",
             )
             return
+        if kind == "invariant":
+            names = ", ".join(f"«{item['title']}»" for item in data.get("items", []))
+            text = {
+                "conflict": f"⛔ запрос задел правило {names} — отвечаю отказом",
+                "redo": f"↻ ответ нарушил правило {names} — переписываю",
+                "blocked": f"⛔ ответ заблокирован правилом {names} — вместо него отказ",
+            }.get(data.get("stage", ""), "")
+            if text:
+                self._set_status(WARN, "правило сработало")
+                self.chat.add_marker(text, "ruleMarker")
+            return
         if kind == "pause":
             # Отложить дело или вернуться к нему может и модель — по просьбе в
             # разговоре. Событие то же самое, что от кнопки, и метка в ленте тоже.
@@ -3158,6 +3503,15 @@ class AgentWindow(QMainWindow):
             if who else
             "↓ профиль отключён: дальше агент отвечает без персонализации."
         )
+        self._refresh()
+
+    def _edit_rules(self) -> None:
+        """Свод нерушимых правил: правку делает агент, окно только показывает.
+
+        Обновляемся после закрытия: правило меняет и вес запроса, и то, на что
+        агент согласится в следующем обращении, — это должно быть видно сразу.
+        """
+        InvariantsDialog(self.agent, self).exec()
         self._refresh()
 
     def _edit_persona(self) -> None:
@@ -3492,10 +3846,33 @@ def _history_table(agent: Agent, history: list[dict]) -> QPlainTextEdit:
     if not people:
         lines.append("-- строк нет: профилей ещё не заводили")
     else:
-        lines += ["", "-- ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ: единственная таблица без agent_id и branch — профиль",
-                  "-- описывает человека, а не разговор, поэтому переживает и смену агента, и",
-                  "-- «забыть разговор», и его можно отдать нескольким агентам. Стрелкой отмечен тот,",
+        lines += ["", "-- ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ: таблица без agent_id и branch — профиль описывает",
+                  "-- человека, а не разговор, поэтому переживает и смену агента, и «забыть",
+                  "-- разговор», и его можно отдать нескольким агентам. Стрелкой отмечен тот,",
                   "-- что подключён к запросам этого агента (ссылка лежит в agents.persona)."]
+
+    # Свод правил — вторая таблица без agent_id и branch, и по той же причине,
+    # только сильнее: правило описывает не разговор и не человека, а работу.
+    rules = agent.rules()
+    lines += [
+        "",
+        "sqlite> SELECT id, kind, title, text, bans, source, turn FROM invariants ORDER BY rowid;",
+        "",
+        f"{'id':<10}  {'kind':<13}  {'source':<7}  {'обр.':>4}  {'bans':<22}  title: text",
+        f"{'-' * 10}  {'-' * 13}  {'-' * 7}  {'-' * 4}  {'-' * 22}  {'-' * 40}",
+    ]
+    for rule in rules:
+        lines.append(
+            f"{rule['id']:<10}  {rule['kind']:<13}  {rule['source']:<7}  {rule['turn']:>4}  "
+            f"{_oneline(', '.join(rule['bans']) or '—', 22):<22}  {rule['title']}: {rule['text']}"
+        )
+    if not rules:
+        lines.append("-- строк нет: нерушимых правил ещё не задавали")
+    else:
+        lines += ["", "-- ИНВАРИАНТЫ: правила лежат ОТДЕЛЬНО ОТ ДИАЛОГА — ни agent_id, ни branch, ни",
+                  "-- привязки к переписке. Поэтому они переживают ветвление, «забыть разговор» и",
+                  "-- удаление агента, который их записал. Колонка bans и есть проверяемость: эти",
+                  "-- слова агент ищет в вопросе до ответа и в своём ответе после."]
 
     branches = agent.branches()
     lines += [
@@ -3568,11 +3945,33 @@ def _layers_page(state: dict, tasks: list[dict]) -> QWidget:
     note.setWordWrap(True)
     lay.addWidget(note)
 
-    # Профиль идёт первым и отдельно от слоёв: он лежит в своей таблице, не
+    # Свод правил идёт первым и тоже отдельно от слоёв: он не про разговор, а про
+    # рамки работы. Слоёв по-прежнему три — как в задании дня 11.
+    book = state["invariants"]
+    lines = ["НЕРУШИМЫЕ ПРАВИЛА — рамки работы (таблица invariants, вне веток и вне агентов)"]
+    if book["count"]:
+        lines.append(f"{book['count']} правил(а), из них проверяются кодом: {book['checkable']}")
+        lines.append(f"вес в запросе: {_num(state['invariants_tokens'])} т., и так в КАЖДОМ обращении")
+        for kind, items in book["by_kind"].items():
+            lines.append(f"  [{config.invariant_kind_label(kind)}]")
+            for rule in items:
+                mark = (f"   [проверяется кодом: {', '.join(rule['bans'])}]" if rule["bans"]
+                        else "   [только просьба в промпте]")
+                lines.append(f"    {rule['title']}: {rule['text']}{mark}")
+                lines.append(f"      внёс: {rule['source_label']}"
+                             + (f", обращение {rule['turn']}" if rule["turn"] else ""))
+        lines += ["  -- запрещённые слова проверяются дважды: в самом вопросе (до генерации) и в",
+                  "  -- готовом ответе (после). Нарушивший ответ до пользователя не доходит: агент",
+                  "  -- один раз переписывает его, а затем отдаёт отказ вместо текста модели."]
+    else:
+        lines.append("-- правил нет: агент ничем не ограничен")
+    lines.append("")
+
+    # Профиль идёт следом и тоже отдельно от слоёв: он лежит в своей таблице, не
     # принадлежит ветке и отвечает не на «что агент помнит», а на «для кого он
     # говорит». Смешать его со слоями значило бы сделать вид, что слоёв четыре.
     who = state["persona"]
-    lines = ["ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ — персонализация поверх памяти (таблица personas, вне веток)"]
+    lines.append("ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ — персонализация поверх памяти (таблица personas, вне веток)")
     if who:
         lines.append(f"профиль «{who['name']}» — {who['summary']}")
         lines.append(f"вес в запросе: {_num(state['persona_tokens'])} т., и так в КАЖДОМ обращении")
@@ -3592,24 +3991,20 @@ def _layers_page(state: dict, tasks: list[dict]) -> QWidget:
     else:
         lines.append("-- профиль не подключён: форму ответа выбирает модель")
 
-    lines += ["", "ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — профиль, решения, знания, инварианты",
+    lines += ["", "ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — профиль, решения, знания",
               f"{'вид':<12} {'источник':<14} {'обр.':>5}  ключ: значение",
               f"{'-' * 12} {'-' * 14} {'-' * 5}  {'-' * 40}"]
     notes = state["long"]["notes"]
     for item in notes:
-        mark = ""
-        if item["kind"] == "invariant":
-            bans = memory.invariant_bans(item["value"])
-            mark = f"   [проверяется кодом: {', '.join(bans)}]" if bans else "   [только просьба в промпте]"
         lines.append(f"{config.note_kind_label(item['kind']):<12} "
                      f"{config.note_source_label(item['source']):<14} {item['turn']:>5}  "
-                     f"{item['key']}: {item['value']}{mark}")
+                     f"{item['key']}: {item['value']}")
     if not notes:
         lines.append("-- записей нет: слой пуст"
                      + ("" if state["long_active"] else " или выключен (стратегия «Факты»)"))
     else:
-        lines += ["", "-- инвариант со словом «запрещено: X, Y» агент сверяет со своим ответом после",
-                  "-- генерации; без этого маркера правило остаётся просьбой в инструкции."]
+        lines += ["", "-- нерушимые правила здесь больше не лежат: у них своя таблица и своя",
+                  "-- проверка — они не про этот разговор, а про работу."]
 
     lines += ["", "РАБОЧАЯ ПАМЯТЬ — конечный автомат текущей задачи"]
     if not state["working"]:
@@ -3743,6 +4138,68 @@ def _persona_line(t, update) -> str:
     if update.broken:
         return head + f" · соблюдено: {len(update.checks) - len(update.broken)} из {len(update.checks)}"
     return head + " · соблюдён полностью: " + ", ".join(check.detail for check in update.checks)
+
+
+def _rules_line(guard) -> str:
+    """Строка под ответом про нерушимые правила: цена рамок и итог сверки.
+
+    Она есть под каждым ответом, пока свод не пуст, а не только когда правило
+    сработало: рамка действует всегда, и её цена платится в каждом запросе.
+    """
+    if guard is None or not guard.rules:
+        return ""
+    return (f"инварианты: {guard.rules} прав. · проверяются кодом: {guard.checkable} · "
+            f"вес: {_num(guard.tokens)} т. · итог: {guard.verdict()}")
+
+
+def _rules_alarm(guard) -> str:
+    """Что именно сработало — отдельной красной строкой, как и расхождение с профилем.
+
+    Разница в том, что здесь это не «замечено и оставлено как есть»: в двух случаях
+    из трёх ответ модели до пользователя не дошёл, и сказать об этом нужно прямо.
+    """
+    if guard is None:
+        return ""
+    if guard.blocked:
+        return ("⛔ ответ заблокирован — он нарушал правило: "
+                + " · ".join(item.what() for item in guard.broken)
+                + ". Пользователю ушёл отказ, а не текст модели.")
+    if guard.redone:
+        return ("⚠ первый ответ нарушал правило "
+                + " · ".join(f"«{item.rule.title}»" for item in guard.broken)
+                + " — агент переписал его, и второй проверку прошёл. Показан переписанный.")
+    if guard.conflicts:
+        return ("⛔ запрос конфликтует с правилом: "
+                + " · ".join(item.what() for item in guard.conflicts)
+                + ". Агент знал об этом до генерации — отказ должен быть в самом ответе.")
+    return ""
+
+
+def _rules_text(state: dict, rows: list[dict]) -> str:
+    """Раздел окна токенов: во что обходятся рамки и что в них проверяется."""
+    book = state["invariants"]
+    if not book["count"]:
+        return (
+            "Нерушимых правил нет: агент ничем не ограничен и согласится на любое решение. "
+            "Задайте правило в панели — и оно уйдёт в каждый запрос отдельным блоком, а ответы "
+            "начнут проверяться: нарушивший до вас не дойдёт."
+        )
+    spent = sum(row.get("invariant_tokens") or 0 for row in rows)
+    turns = sum(1 for row in rows if row.get("invariant_tokens"))
+    blocked = sum(1 for row in rows if row.get("invariant_blocked"))
+    asked = book["count"] - book["checkable"]
+    return (
+        f"Свод из {book['count']} правил(а) весит {_num(state['invariants_tokens'])} токенов и уходит "
+        f"в КАЖДЫЙ запрос — за {turns} обращен(ий) это {_num(spent)} токенов. Как и профиль, эта цена "
+        "с разговором не растёт: правила не накапливаются вместе с историей.\n"
+        f"Проверяются кодом {book['checkable']} правил(а) — те, у которых заданы запрещённые слова. "
+        "Проверка идёт дважды и обе стоят ноль токенов: запрос сверяется до генерации, ответ — после. "
+        "Лишний вызов модели случается только при настоящем нарушении, когда ответ переписывается."
+        + (f"\nЗа всё время заблокировано ответов: {blocked} — столько раз пользователь получил отказ "
+           f"вместо текста модели." if blocked else "\nЗаблокированных ответов пока не было.")
+        + (f"\nОстальные {asked} правил(а) уходят просьбой в инструкцию и кодом не проверяются: "
+           "запрещённых слов у них нет." if asked else "")
+    )
 
 
 def _compression_line(t) -> str:
@@ -3970,14 +4427,14 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
     """Расход так, как он лежит в базе: строка таблицы `usage` — строка текста."""
     lines = [
         "sqlite> SELECT turn, strategy, llm_calls, prompt_tokens, completion_tokens, cost_usd, context_tokens,",
-        "               persona_tokens, summary_tokens, long_tokens, task_tokens, folded_messages,",
+        "               invariant_tokens, persona_tokens, summary_tokens, long_tokens, task_tokens, folded_messages,",
         f"               dropped_messages, estimated FROM usage WHERE agent_id = '{agent_id}' ORDER BY id;",
         "",
         f"{'обр.':>5} {'стратегия':<12} {'выз.':>5} {'запрос':>8} {'ответ':>7} {'стоимость':>10} "
-        f"{'накоплено':>10} {'контекст':>9} {'профиль':>8} {'суммаризация':>12} {'долгоср.':>8} "
-        f"{'задача':>6} {'вместо':>6} {'за окном':>8} {'оценка':>8} {'расх.':>7}",
-        f"{'-' * 5} {'-' * 12} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 8} "
-        f"{'-' * 12} {'-' * 8} {'-' * 6} {'-' * 6} {'-' * 8} {'-' * 8} {'-' * 7}",
+        f"{'накоплено':>10} {'контекст':>9} {'инвар.':>7} {'профиль':>8} {'суммаризация':>12} "
+        f"{'долгоср.':>8} {'задача':>6} {'вместо':>6} {'за окном':>8} {'оценка':>8} {'расх.':>7}",
+        f"{'-' * 5} {'-' * 12} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 7} "
+        f"{'-' * 8} {'-' * 12} {'-' * 8} {'-' * 6} {'-' * 6} {'-' * 8} {'-' * 8} {'-' * 7}",
     ]
     running = 0.0
     for row in rows:
@@ -3992,7 +4449,9 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
             f"{row['turn']:>5} {strategy:<12} "
             f"{row['llm_calls']:>5} {row['prompt_tokens']:>8} "
             f"{row['completion_tokens']:>7} {_money(row['cost_usd']):>10} {_money(running):>10} "
-            f"{actual:>9} {row.get('persona_tokens') or 0:>8} {row.get('summary_tokens') or 0:>12} "
+            f"{actual:>9} {row.get('invariant_tokens') or 0:>7}"
+            f"{'*' if row.get('invariant_blocked') else ' '}{row.get('persona_tokens') or 0:>8} "
+            f"{row.get('summary_tokens') or 0:>12} "
             f"{row.get('long_tokens') or row.get('facts_tokens') or 0:>8} "
             f"{row.get('task_tokens') or 0:>6} "
             f"{row.get('folded_messages') or 0:>6} {row.get('dropped_messages') or 0:>8} "
@@ -4004,7 +4463,9 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
         lines += [
             "",
             "-- «запрос» и «ответ» — факт по всем вызовам обращения (план, шаги, итог, суммаризация,",
-            "-- маршрутизатор, теневой ответ), «контекст» — вес первого запроса, «профиль» — сколько",
+            "-- маршрутизатор, теневой ответ), «контекст» — вес первого запроса, «инвар.» — сколько в",
+            "-- нём занял свод нерушимых правил (звёздочка рядом — в этом обращении ответ модели был",
+            "-- заблокирован и пользователь получил отказ), «профиль» — сколько",
             "-- в нём занял профиль пользователя (он платится в каждом запросе), «суммаризация»,"
             "-- «долгоср.» и «задача» — сколько в нём заняли блоки слоёв памяти, «вместо» — скольких",
             "-- сообщений вместо суммаризация, «за окном» — сколько сообщений истории не ушло дословно,",

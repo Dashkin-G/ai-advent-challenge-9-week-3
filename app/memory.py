@@ -40,7 +40,6 @@
 `store.py` это хранит, `gui.py` показывает.
 """
 import json
-import re
 import time
 from dataclasses import dataclass, field
 
@@ -96,14 +95,6 @@ PAUSED_NOTE = (
     "\n\nОтложенная задача: {bookmark}. Она на паузе: карточки сейчас нет в контексте, работу по "
     "ней не продолжай и о её содержимом не догадывайся. Скажут «продолжаем» — карточка вернётся "
     "целиком и работа пойдёт с того же шага."
-)
-
-# Инварианты — единственные записи памяти, которые проверяются кодом. В запрос они
-# уходят отдельным блоком с прямой оговоркой: это не пожелание.
-INVARIANTS_NOTE = (
-    "\n\nНерушимые правила работы ({count} шт.). Это не пожелания: агент сверяет с ними твой ответ "
-    "после генерации и показывает нарушения пользователю. Нарушать их нельзя даже по прямой просьбе — "
-    "лучше объясни, почему не можешь.\nИнварианты:\n{items}"
 )
 
 # Роль маршрутизатора. Он не отвечает пользователю и не рассуждает — он раскладывает
@@ -164,9 +155,7 @@ ROUTER_SYSTEM = (
     "ДОЛГОВРЕМЕННАЯ ПАМЯТЬ — то, что переживёт эту задачу, записями «ключ: значение» четырёх видов:\n"
     "  profile — кто собеседник: имя, занятие, предпочтения, как с ним говорить;\n"
     "  decisions — что решено и о чём договорились, по возможности с причиной;\n"
-    "  knowledge — факты о предмете, проекте и мире, которые пригодятся и завтра;\n"
-    "  invariants — нерушимые правила работы (стек, архитектура, запреты). Сюда только то, что "
-    "пользователь задал как правило «всегда» или «никогда», а не разовую просьбу.\n"
+    "  knowledge — факты о предмете, проекте и мире, которые пригодятся и завтра.\n"
     "Не клади в долговременную память ход текущей работы и промежуточные результаты — это рабочая "
     "память. Не клади вежливость, рассуждения, пересказ общеизвестного и то, о чём только спросили, "
     "но не решили.\n"
@@ -185,8 +174,8 @@ ROUTER_SYSTEM = (
     '"steps": [{{"text": "...", "done": true}}], "findings": ["..."], "artifacts": ["..."], '
     '"questions": ["..."], "paused": false, '
     '"expect": {{"who": "agent|user", "what": "чего ждём дальше"}}}}, '
-    '"long": {{"profile": {{"ключ": "значение"}}, "decisions": {{}}, "knowledge": {{}}, '
-    '"invariants": {{}}}}{schema}}}'
+    '"long": {{"profile": {{"ключ": "значение"}}, "decisions": {{}}, "knowledge": {{}}}}'
+    '{schema}}}'
 )
 
 ROUTER_USER = (
@@ -244,26 +233,12 @@ class LongTerm:
         return {kind: items for kind, items in groups.items() if items}
 
     def text(self) -> str:
-        """Блок в том виде, в каком он уходит модели: заголовок вида, под ним записи.
-
-        Инварианты сюда не входят: у них свой блок в инструкции и своя проверка
-        после ответа, и смешивать закон с памятью о разговоре не стоит.
-        """
+        """Блок в том виде, в каком он уходит модели: заголовок вида, под ним записи."""
         lines = []
         for kind, items in self.by_kind().items():
-            if kind == "invariant":
-                continue
             lines.append(f"[{config.note_kind_label(kind)}]")
             lines.extend(f"- {note.key}: {note.value}" for note in items)
         return "\n".join(lines)
-
-    def invariants(self) -> list[Note]:
-        """Нерушимые правила: единственные записи, которые проверяются кодом."""
-        return [note for note in self.notes.values() if note.kind == "invariant"]
-
-    def invariants_text(self) -> str:
-        """Инварианты в том виде, в каком они уходят модели."""
-        return "\n".join(f"- {note.key}: {note.value}" for note in self.invariants())
 
     def items(self) -> list[dict]:
         """Записи подряд, для интерфейса и хранилища."""
@@ -786,8 +761,9 @@ REMEMBER = {
         "description": (
             "Положить важное в свою память, явно выбрав слой. layer=\"long\" — долговременная "
             "память (переживёт задачу): kind=profile про собеседника, kind=decision про принятое "
-            "решение, kind=knowledge про факт предметной области, kind=invariant про нерушимое "
-            "правило работы («всегда…», «никогда…»); нужен короткий key. "
+            "решение, kind=knowledge про факт предметной области; нужен короткий key. "
+            "Нерушимое правило работы («всегда…», «никогда…») сюда не клади — для него "
+            "отдельный инструмент restrict. "
             "layer=\"working\" — рабочая память текущей задачи: kind=goal цель, step шаг, "
             "finding находка, artifact созданный файл, question открытый вопрос. Вызывай, когда "
             "прозвучало что-то, что понадобится позже; не клади сюда вежливость и общеизвестное."
@@ -798,9 +774,9 @@ REMEMBER = {
                 "layer": {"type": "string", "enum": ["long", "working"],
                           "description": "Слой памяти: long — долговременная, working — текущая задача"},
                 "kind": {"type": "string",
-                         "enum": ["profile", "decision", "knowledge", "invariant",
+                         "enum": ["profile", "decision", "knowledge",
                                   "goal", "step", "finding", "artifact", "question"],
-                         "description": "Вид записи: для long — profile/decision/knowledge/invariant, "
+                         "description": "Вид записи: для long — profile/decision/knowledge, "
                                         "для working — goal/step/finding/artifact/question"},
                 "key": {"type": "string",
                         "description": "Короткий ключ записи (обязателен для layer=long)"},
@@ -1017,8 +993,7 @@ def parse_router(content: str) -> dict | None:
         raw_long = {}
     long_items: dict[str, dict[str, str]] = {}
     aliases = {"profile": "profile", "decisions": "decision", "decision": "decision",
-               "knowledge": "knowledge", "facts": "knowledge",
-               "invariants": "invariant", "invariant": "invariant"}
+               "knowledge": "knowledge", "facts": "knowledge"}
     for raw_kind, values in raw_long.items():
         kind = aliases.get(str(raw_kind).strip().lower())
         if kind is None or not isinstance(values, dict):
@@ -1181,75 +1156,6 @@ def merge_task(task: Task, card: dict, turn: int) -> list[Route]:
     return routes
 
 
-# --- Инварианты: правило, которое проверяет код, а не только просит промпт -----
-
-# Запреты внутри инварианта: «стек: пишем на Python, запрещено: Kotlin, Java».
-# Всё, что после маркера и до конца значения, — список через запятую.
-_BAN_MARKERS = ("запрещено:", "нельзя:", "запрещены:", "запрещён:", "запрещена:")
-
-
-def invariant_bans(value: str) -> list[str]:
-    """Слова, запрещённые инвариантом (пусто, если правило без явного запрета).
-
-    Формат нарочно простой и видимый пользователю: правило без маркера остаётся
-    просьбой в промпте, правило с маркером становится проверяемым. Придумывать
-    здесь разбор естественного языка не нужно — он был бы ненадёжен, а выглядел
-    бы как гарантия.
-    """
-    low = (value or "").lower()
-    for marker in _BAN_MARKERS:
-        at = low.find(marker)
-        if at >= 0:
-            tail = value[at + len(marker):]
-            return [word for word in (part.strip(" .;»«\"'") for part in tail.split(",")) if word]
-    return []
-
-
-# Строки, в которых агент как раз ОТКАЗЫВАЕТСЯ нарушать инвариант, из проверки
-# исключаются: «я не могу показать код на Java» — это соблюдение правила, а не его
-# нарушение, хотя запрещённое слово в строке есть. Без этого фильтра честный отказ
-# засчитывался бы как нарушение — проверено на живом прогоне.
-_REFUSAL_MARKERS = (
-    "не могу", "не буду", "не стану", "нельзя", "запрещ", "инвариант", "правил",
-    "вместо", "не использу", "не подход", "не соответству",
-)
-
-
-def check_invariants(answer: str, long: LongTerm) -> list[str]:
-    """Сверить ответ агента с инвариантами: что именно нарушено.
-
-    Это вторая линия защиты. Первая — текст инварианта в инструкции, но текст
-    остаётся просьбой: модель может её нарушить, и без проверки этого никто не
-    заметит. Здесь нарушение становится видимым фактом под ответом.
-
-    Проверка нарочно простая: поиск запрещённых слов по границам слова, минус
-    строки, в которых агент объясняет свой отказ. Семантики здесь нет и быть не
-    должно — иначе это была бы ещё одна модель, которой тоже надо верить. Цена
-    простоты честная: правило вида «пиши коротко» так не проверить, и в окне такое
-    правило прямо помечено как непроверяемое.
-    """
-    if not answer:
-        return []
-    usable = "\n".join(
-        line for line in answer.splitlines()
-        if not any(marker in line.lower() for marker in _REFUSAL_MARKERS)
-    )
-    violations = []
-    for note in long.notes.values():
-        if note.kind != "invariant":
-            continue
-        hit = [word for word in invariant_bans(note.value) if _mentions(usable, word)]
-        if hit:
-            violations.append(f"«{note.key}»: в ответе встретилось {', '.join(hit)}")
-    return violations
-
-
-def _mentions(text: str, word: str) -> bool:
-    """Есть ли слово в тексте как отдельное слово, а не как часть другого."""
-    pattern = r"(?<![0-9A-Za-zЀ-ӿ_])" + re.escape(word) + r"(?![0-9A-Za-zЀ-ӿ_])"
-    return re.search(pattern, text, re.IGNORECASE) is not None
-
-
 def handoff(task: Task, long: LongTerm, turn: int) -> Route | None:
     """Переток при закрытии задачи: её итог остаётся записью в долговременной памяти.
 
@@ -1272,7 +1178,8 @@ def handoff(task: Task, long: LongTerm, turn: int) -> Route | None:
 
 # --- Правила в коде: что попадает в слои без всякой модели --------------------
 
-def rules_from_turn(task: Task, plan: list[str], steps: list) -> list[Route]:
+def rules_from_turn(task: Task, plan: list[str], steps: list,
+                    own: frozenset = frozenset()) -> list[Route]:
     """Разложить по рабочей памяти то, что видно из самого обращения.
 
     Никакой модели здесь нет — это детерминированные правила агента: план стал
@@ -1282,6 +1189,11 @@ def rules_from_turn(task: Task, plan: list[str], steps: list) -> list[Route]:
 
     На паузе правила молчат: отложенная задача не должна обрастать шагами и
     находками из разговора, который идёт уже не про неё.
+
+    `own` — инструменты, которыми агент пишет в самого себя (память, профиль, свод
+    правил). Находкой они не становятся: запись правила — это не результат работы
+    над задачей, а изменение рамок, и в карточке она была бы шумом. Имена приходят
+    снаружи, чтобы модель памяти не знала про соседние сущности.
     """
     if task.paused:
         return []
@@ -1304,7 +1216,7 @@ def rules_from_turn(task: Task, plan: list[str], steps: list) -> list[Route]:
                 task.artifacts.append(path)
                 routes.append(Route(layer="working", action="add", kind="artifact", source="rule",
                                     what=f"файл: {path}"))
-        elif step.tool not in TOOL_NAMES:
+        elif step.tool not in TOOL_NAMES and step.tool not in own:
             finding = f"{step.title}: {_clean(step.result, 160)}"
             if finding not in task.findings and len(task.findings) < config.TASK_ITEMS_LIMIT:
                 task.findings.append(finding)
@@ -1345,6 +1257,8 @@ def notes_from_rows(rows: list[dict]) -> LongTerm:
         if not key:
             continue
         kind = row.get("kind") or "knowledge"
+        if kind == "invariant":
+            continue     # правило дня 11: его место теперь в своде (app/invariants.py)
         long.notes[key] = Note(
             key=key,
             value=_clean(row.get("value"), 200),
@@ -1383,9 +1297,8 @@ def notes_from_facts(content: str, turn: int = 0, at: float | None = None) -> Lo
 
 def _long_payload(long: LongTerm) -> dict:
     """Долговременная память в том виде, в каком её понимает маршрутизатор."""
-    payload = {"profile": {}, "decisions": {}, "knowledge": {}, "invariants": {}}
-    bucket = {"profile": "profile", "decision": "decisions", "knowledge": "knowledge",
-              "invariant": "invariants"}
+    payload = {"profile": {}, "decisions": {}, "knowledge": {}}
+    bucket = {"profile": "profile", "decision": "decisions", "knowledge": "knowledge"}
     for note in long.notes.values():
         payload[bucket.get(note.kind, "knowledge")][note.key] = note.value
     return payload

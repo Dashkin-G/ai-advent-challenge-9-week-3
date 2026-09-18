@@ -53,6 +53,15 @@
 а после генерации ответ сверяется с профилем (`persona.check`), и расхождения
 видно под ответом.
 
+Рядом с ними — свод нерушимых правил (`app/invariants.py`): архитектура, принятые
+решения, ограничения по стеку, бизнес-правила. Он лежит отдельно от диалога, уходит
+в каждый запрос своим блоком и проверяется кодом дважды: `screen()` смотрит сам
+запрос ещё до генерации, `check()` — готовый ответ. Нарушивший ответ до
+пользователя не доходит: один раз агент просит модель переписать его, а если и
+переписанный нарушает — наружу уходит отказ, собранный кодом. В этом и разница
+между «правило в промпте» и правилом: первое модель нарушает, второе не проходит
+дальше кода.
+
 Что делать с тем, что выпало из окна краткосрочной памяти, решает стратегия
 контекста (`strategy`):
 
@@ -86,7 +95,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import config, llm, memory, persona, tokens, tools
+from . import config, invariants, llm, memory, persona, tokens, tools
 from .store import MAIN_BRANCH, Store
 
 logger = logging.getLogger("app.agent")
@@ -423,6 +432,9 @@ class TokenReport:
     persona_name: str = ""        # его название — для строки под ответом
     persona_items: int = 0        # сколько в нём пунктов (0 — профиль не подключён)
     persona_summary: str = ""     # стиль · формат · длина одной строкой
+    invariant_items: int = 0      # сколько нерушимых правил ушло в запрос
+    invariant_checkable: int = 0  # из них проверяются кодом после ответа
+    invariant_conflict: bool = False  # сам запрос конфликтовал с правилом
     task_state: str = ""          # этап автомата, на котором шло обращение
     task_step: int = 0            # номер текущего шага плана
     task_total: int = 0           # всего шагов в плане
@@ -499,6 +511,9 @@ class TokenReport:
             "persona_name": self.persona_name,
             "persona_items": self.persona_items,
             "persona_summary": self.persona_summary,
+            "invariant_items": self.invariant_items,
+            "invariant_checkable": self.invariant_checkable,
+            "invariant_conflict": self.invariant_conflict,
             "task_state": self.task_state,
             "task_step": self.task_step,
             "task_total": self.task_total,
@@ -539,7 +554,10 @@ class AgentReply:
     # Та же ловушка с именем поля, что и у `memory`: имя совпадает с именем модуля,
     # поэтому аннотация обязательно строкой.
     persona: "persona.PersonaUpdate | None" = None   # правки профиля и сверка ответа с ним
-    violations: list[str] = field(default_factory=list)  # какие инварианты нарушил ответ
+    # Итог по нерушимым правилам: сколько их применялось, был ли конфликт с
+    # запросом, нарушил ли ответ правило, переписывался ли он и дошёл ли до
+    # пользователя вообще.
+    guard: "invariants.Guard | None" = None
     shadow: Shadow | None = None    # теневой ответ «с полной историей» для сравнения
     request: dict | None = None     # «сырой обмен»: тело последнего запроса
     response: dict | None = None    # «сырой обмен»: ответ модели как есть
@@ -564,7 +582,7 @@ class AgentReply:
             "compression": self.compression.to_dict() if self.compression else None,
             "memory": self.memory.to_dict() if self.memory else None,
             "persona": self.persona.to_dict() if self.persona else None,
-            "violations": list(self.violations),
+            "guard": self.guard.to_dict() if self.guard else None,
             "shadow": self.shadow.to_dict() if self.shadow else None,
             "request": self.request,
             "response": self.response,
@@ -630,6 +648,13 @@ class Agent:
     # Профиль пользователя: сам объект (см. app/persona.py). Аннотация строкой —
     # имя поля совпадает с именем модуля.
     _persona: "persona.Persona | None" = field(default=None, repr=False)
+    # Свод нерушимых правил (см. app/invariants.py). Он общий: лежит в своей
+    # таблице, не принадлежит ни ветке, ни агенту, и перечитывается перед каждым
+    # обращением — правило могли поправить из соседнего агента.
+    _book: "invariants.Book" = field(default_factory=invariants.Book, repr=False)
+    # Итог по правилам за обращение: что применялось, был ли конфликт, чем кончилась
+    # сверка. Наполняется по ходу, как `_live` и `_persona_update`.
+    _guard: "invariants.Guard" = field(default_factory=invariants.Guard, repr=False)
     # Что агент положил в слои инструментом за это обращение — копится по ходу цикла
     # и уходит в трассу вместе с решениями маршрутизатора.
     _tool_routes: list = field(default_factory=list, repr=False)
@@ -655,6 +680,8 @@ class Agent:
         """
         if self.store is not None and self._persona is None and self.persona_id:
             self._load_persona()
+        if self.store is not None and not self._book:
+            self._load_invariants()
 
     # ------------------------------------------------------------------- вход --
 
@@ -692,6 +719,10 @@ class Agent:
             name=self._persona.name if self._persona else "",
         )
         self._notify = on_event if callable(on_event) else _silent
+        # Свод общий: его могли поправить из соседнего агента или из другого окна,
+        # поэтому перед каждым обращением он перечитывается — один SELECT.
+        self._load_invariants()
+        self._guard = invariants.Guard()
         # Этап на начало обращения: маршрутизатор увидит именно его и, «оставляя всё
         # как есть», вернёт то же значение. Если к тому моменту код уже сдвинул этап
         # по факту работы, такой ответ — не просьба вернуться назад (см. _call_router).
@@ -711,6 +742,7 @@ class Agent:
             self.strategy, self.summarize, self.working, self._branch["name"],
         )
 
+        conflicts = self._screen(text)                      #    рубеж 1: конфликт в запросе
         plan = self._make_plan(text, totals)                # 2. план действий
         if plan:
             self._notify("plan", {"steps": list(plan)})
@@ -718,9 +750,12 @@ class Agent:
         # рабочая память наполняется задним числом и движения этапов не видно.
         self._live_rules(plan, [])
         specs = self._specs()
-        prompt = self._system_prompt(plan)
+        prompt = self._system_prompt(plan, conflicts=conflicts)
         summary_block = self._summary_block()               #    блоки слоёв внутри инструкции
-        long_block = self._long_block() + self._invariants_block()
+        long_block = self._long_block()
+        # Свод правил и найденный конфликт — не слой памяти и не стратегия: считаем
+        # их отдельной частью запроса, иначе цена правил растворилась бы в инструкции.
+        rules_block = self._invariants_block() + invariants.conflict_note(conflicts)
         task_block = self._task_block()
         persona_block = self._persona_block()               #    профиль пользователя — тоже блок
         window, dropped = self._fit_context(prompt, text, specs)   # 3. бюджет контекста
@@ -728,7 +763,7 @@ class Agent:
         report = TokenReport(
             breakdown=tokens.measure(prompt, window, text, specs, self.model,
                                      summary=summary_block, long=long_block, task=task_block,
-                                     persona=persona_block),
+                                     persona=persona_block, invariants=rules_block),
             limit=self._context_limit(),
             reserve=self._answer_reserve(),
             max_output=config.model_max_output(self.model),
@@ -750,6 +785,9 @@ class Agent:
             persona_name=self._persona.name if self._persona else "",
             persona_items=self._persona.size() if self._persona else 0,
             persona_summary=self._persona.summary() if self._persona else "",
+            invariant_items=len(self._book),
+            invariant_checkable=len(self._book.checkable()),
+            invariant_conflict=bool(conflicts),
             task_state=self._task.state if task_block else "",
             task_step=self._task.step if task_block else 0,
             task_total=self._task.total if task_block else 0,
@@ -765,13 +803,13 @@ class Agent:
         report.estimated = report.breakdown.total
         messages = self._build_messages(prompt, window, text)      #    сборка запроса
         logger.info(
-            "Агент «%s» [%s]: в запрос уйдёт ≈%d токенов (инструкция %d + профиль %d + "
-            "суммаризация %d + долговременная %d + задача %d + память %d + вопрос %d + схемы %d) "
-            "из окна %d · за окном %d сообщ. ≈ %d токенов",
+            "Агент «%s» [%s]: в запрос уйдёт ≈%d токенов (инструкция %d + инварианты %d + "
+            "профиль %d + суммаризация %d + долговременная %d + задача %d + память %d + "
+            "вопрос %d + схемы %d) из окна %d · за окном %d сообщ. ≈ %d токенов",
             self.profile.name, self.id, report.estimated, report.breakdown.system,
-            report.breakdown.persona, report.breakdown.summary, report.breakdown.long,
-            report.breakdown.task, report.breakdown.memory, report.breakdown.question,
-            report.breakdown.tools, report.limit, beyond, beyond_tokens,
+            report.breakdown.invariants, report.breakdown.persona, report.breakdown.summary,
+            report.breakdown.long, report.breakdown.task, report.breakdown.memory,
+            report.breakdown.question, report.breakdown.tools, report.limit, beyond, beyond_tokens,
         )
 
         raw, first_usage = None, None
@@ -796,7 +834,7 @@ class Agent:
             raw = totals.add(self._call(messages, None))
 
         answer = self._postprocess(raw["content"], steps)   # 5. разбор ответа
-        violations = self._check_invariants(answer)         #    сверка ответа с инвариантами
+        answer = self._enforce(answer, messages, totals)    #    рубеж 2: сверка ответа с правилами
         self._check_persona(answer)                         #    сверка ответа с профилем пользователя
         shadow = None
         if compare:
@@ -841,7 +879,7 @@ class Agent:
             compression=folded,
             memory=routed,
             persona=personal,
-            violations=violations,
+            guard=self._guard_report(report),
             shadow=shadow,
             request=raw["request"],
             response=raw["response"],
@@ -919,11 +957,13 @@ class Agent:
         Инструменты памяти (`remember`, `recall`) идут вместе с остальными и по
         тому же тумблеру: обещать модели то, чего у неё нет, нельзя, а схемы в
         любом случае платные. Выключены оба слоя — их схемы не уходят тоже.
+        `restrict` выдаётся всегда: свод не выключается и пополняется даже пустым.
         """
         if not self.tools_enabled:
             return None
         return (tools.specs() + memory.tool_specs(self._long_on, self.working)
-                + persona.tool_specs(self._persona is not None))
+                + persona.tool_specs(self._persona is not None)
+                + invariants.tool_specs(True))
 
     @property
     def _long_on(self) -> bool:
@@ -1017,6 +1057,7 @@ class Agent:
         window: list[dict] | None = None,
         blocks: bool = True,
         who: object = _SELF,
+        conflicts: "list | None" = None,
     ) -> str:
         """Роль агента, дополненная правилами про инструменты, слои памяти, профиль и план.
 
@@ -1028,8 +1069,12 @@ class Agent:
 
         `who` — чей профиль подключить: по умолчанию свой, `None` — вообще без
         профиля, другой профиль — для теневого сравнения «ответы для разных
-        профилей». Профиль идёт последним блоком, перед самим вопросом: это
-        требования к ответу, и модель точнее держит их, когда они рядом с задачей.
+        профилей». Профиль идёт предпоследним блоком, а последним — свод нерушимых
+        правил и, если он есть, конфликт запроса с правилом: это требования к
+        ответу, и модель точнее держит их, когда они рядом с самим вопросом.
+
+        Свод при этом не зависит от `blocks`: блоки — это стратегия памяти, а
+        правило работает всегда, в том числе в теневом запросе с полной историей.
         """
         window = self._memory if window is None else window
         prompt = self.profile.instructions
@@ -1041,7 +1086,7 @@ class Agent:
                 prompt += MEMORY_TOOLS_NOTE
             if profile is not None:
                 prompt += persona.TOOLS_NOTE
-        block = (self._summary_block() + self._long_block() + self._invariants_block()
+        block = (self._summary_block() + self._long_block()
                  + self._task_block()) if blocks else ""
         prompt += block
         if window:
@@ -1056,6 +1101,10 @@ class Agent:
             )
         if profile is not None:
             prompt += profile.block()
+        prompt += self._invariants_block()
+        prompt += invariants.conflict_note(conflicts or [])
+        if self.tools_enabled and self._book:
+            prompt += invariants.TOOLS_NOTE
         return prompt
 
     def _summary_block(self) -> str:
@@ -1118,17 +1167,13 @@ class Agent:
         )
 
     def _invariants_block(self) -> str:
-        """Инварианты в том виде, в каком они уходят в инструкцию.
+        """Свод нерушимых правил в том виде, в каком он уходит в инструкцию.
 
-        Отдельно от остальной долговременной памяти: это не воспоминание, а закон,
-        и после ответа он ещё и проверяется (`_check_invariants`).
+        Ни от стратегии контекста, ни от слоёв памяти он не зависит: правило
+        проекта — не воспоминание о разговоре, и выключать его вместе с памятью
+        было бы неправильно. Пусто здесь значит только одно: правил ещё не задали.
         """
-        if not self._long_on:
-            return ""
-        items = self._long.invariants()
-        if not items:
-            return ""
-        return memory.INVARIANTS_NOTE.format(count=len(items), items=self._long.invariants_text())
+        return self._book.block()
 
     def _persona_block(self) -> str:
         """Профиль пользователя в том виде, в каком он уходит в инструкцию.
@@ -1196,6 +1241,8 @@ class Agent:
             result, ok = self._memory_tool(name, arguments)
         elif name in persona.TOOL_NAMES:
             result, ok = self._persona_tool(name, arguments)
+        elif name in invariants.TOOL_NAMES:
+            result, ok = self._invariant_tool(name, arguments)
         else:
             try:
                 result, ok = tools.call(name, call["arguments"]), True
@@ -1211,7 +1258,8 @@ class Agent:
         )
         tool = tools.BY_NAME.get(name)
         title = tool.title if tool else (
-            memory.TOOL_TITLES.get(name) or persona.TOOL_TITLES.get(name, name))
+            memory.TOOL_TITLES.get(name) or persona.TOOL_TITLES.get(name)
+            or invariants.TOOL_TITLES.get(name, name))
         return AgentStep(
             number=number,
             tool=name,
@@ -1222,21 +1270,108 @@ class Agent:
             elapsed_s=elapsed,
         )
 
-    def _check_invariants(self, answer: str) -> list[str]:
-        """Сверить свой же ответ с инвариантами долговременной памяти.
+    def _screen(self, text: str) -> list:
+        """Рубеж 1: не просит ли САМ ЗАПРОС того, что правило запрещает.
 
-        Правило, написанное в инструкции словами, — просьба: модель может её
-        нарушить, и без проверки этого никто не заметит. Здесь нарушение
-        становится фактом, который видно под ответом. Ответ при этом не
-        перегенерируется: агент показывает нарушение, а решение — за человеком.
+        Стоит ноль токенов и срабатывает до всякой генерации, поэтому конфликт
+        разбирается заранее: в инструкцию уходит блок конфликта, и агент отвечает
+        отказом своими словами. Объяснение живой моделью понятнее шаблона, а
+        гарантию даёт второй рубеж — сверка готового ответа.
         """
-        if not self._long_on:
-            return []
-        violations = memory.check_invariants(answer, self._long)
-        if violations:
-            logger.warning("Агент «%s» [%s]: ответ нарушает инварианты — %s",
-                           self.profile.name, self.id, "; ".join(violations))
-        return violations
+        conflicts = invariants.screen(text, self._book)
+        self._guard.conflicts = conflicts
+        if conflicts:
+            logger.info("Агент «%s» [%s]: запрос конфликтует с правилами — %s",
+                        self.profile.name, self.id,
+                        "; ".join(item.what() for item in conflicts))
+            self._notify("invariant", {"stage": "conflict",
+                                       "items": [item.to_dict() for item in conflicts]})
+        return conflicts
+
+    def _enforce(self, answer: str, messages: list[dict], totals: _Totals) -> str:
+        """Рубеж 2: сверить готовый ОТВЕТ со сводом и не пропустить нарушение.
+
+        Здесь и проходит граница между «агент старается соблюдать правила» и
+        «правила соблюдаются». Нарушивший ответ не помечается, а переписывается:
+        модель получает прямое указание, что именно нарушено, и последнюю попытку.
+        Нарушила и её — до пользователя не доходит ни слова из этого ответа, вместо
+        него отказ, собранный кодом (`invariants.refusal`).
+
+        Перегенерация недёшева, поэтому она и случается только при настоящем
+        нарушении: в обычном разговоре оба рубежа стоят ноль токенов. Инструменты
+        в повторный вызов не отдаются — на этом шаге нужен текст, а не работа.
+        """
+        violations = invariants.check(answer, self._book)
+        if not violations:
+            return answer
+
+        logger.warning("Агент «%s» [%s]: ответ нарушает правила — %s",
+                       self.profile.name, self.id,
+                       "; ".join(item.what() for item in violations))
+        for _ in range(max(0, config.INVARIANT_RETRIES)):
+            self._notify("invariant", {"stage": "redo",
+                                       "items": [item.to_dict() for item in violations]})
+            retry = messages + [
+                {"role": "assistant", "content": answer},
+                {"role": "system", "content": invariants.redo_note(violations)},
+            ]
+            try:
+                raw = totals.add(self._call(retry, None))
+                fixed = self._postprocess(raw["content"], [])
+            except AgentError as e:
+                logger.warning("Агент «%s» [%s]: переписать ответ не удалось (%s)",
+                               self.profile.name, self.id, e)
+                break
+            self._guard.redone = True
+            again = invariants.check(fixed, self._book)
+            if not again:
+                self._guard.broken = violations
+                logger.info("Агент «%s» [%s]: ответ переписан и правила больше не нарушает",
+                            self.profile.name, self.id)
+                return fixed
+            answer, violations = fixed, again
+
+        self._guard.broken = violations
+        self._guard.blocked = True
+        self._guard.dropped = _short(answer, 400)
+        self._notify("invariant", {"stage": "blocked",
+                                   "items": [item.to_dict() for item in violations]})
+        logger.warning("Агент «%s» [%s]: ответ заблокирован — вместо него отказ по правилам %s",
+                       self.profile.name, self.id,
+                       ", ".join(f"«{item.rule.title}»" for item in violations))
+        return invariants.refusal(violations)
+
+    def _guard_report(self, report: TokenReport) -> "invariants.Guard | None":
+        """Итог по правилам за обращение: сколько их, во что обошлись, чем кончилось."""
+        guard = self._guard
+        guard.rules = len(self._book)
+        guard.checkable = len(self._book.checkable())
+        guard.tokens = report.breakdown.invariants
+        if not guard:
+            return None
+        if guard.changes:
+            logger.info("Агент «%s» [%s]: свод правил обновлён — %s",
+                        self.profile.name, self.id,
+                        "; ".join(f"{change.what} ({config.invariant_source_label(change.source)})"
+                                  for change in guard.changes))
+        return guard
+
+    def _invariant_tool(self, name: str, arguments: dict) -> tuple[str, bool]:
+        """Исполнить `restrict`: агент сам вносит правило в свод.
+
+        Третий источник правил — после человека в окне и маршрутизатора после
+        ответа. Как и у инструментов памяти, схема живёт в своём модуле, а
+        исполнение здесь: правило меняет рамки этого же агента, и чистая функция
+        инструмента о них знать не может.
+        """
+        try:
+            result, change = invariants.apply_restrict(arguments, self._book, self.turns + 1)
+        except ValueError as e:
+            return f"Ошибка инструмента: {e}", False
+        self._guard.changes.append(change)
+        logger.info("Агент «%s» [%s]: инструмент правил — %s",
+                    self.profile.name, self.id, change.what)
+        return result, True
 
     def _memory_tool(self, name: str, arguments: dict) -> tuple[str, bool]:
         """Исполнить инструмент памяти: агент кладёт в свой слой или читает из него.
@@ -1331,7 +1466,8 @@ class Agent:
         # ждём маршрутизатора, он разберётся лучше.
         if self._task is not None or len(plan) > 1:
             task = self._ensure_task(turn=self.turns + 1)
-            self._live.routes.extend(memory.rules_from_turn(task, plan, steps))
+            self._live.routes.extend(memory.rules_from_turn(
+                task, plan, steps, own=persona.TOOL_NAMES | invariants.TOOL_NAMES))
             self._apply_transition(task, memory.overdue_state(task), self._live, source="rule")
 
     def _ensure_task(self, hint: str = "", turn: int = 0) -> "memory.Task":
@@ -1387,12 +1523,14 @@ class Agent:
 
     @property
     def _routing(self) -> bool:
-        """Есть ли кому маршрутизировать: управляемый слой памяти или профиль.
+        """Есть ли кому маршрутизировать: слой памяти, профиль или свод правил.
 
         Профиль попал сюда не для симметрии: просьбу «отвечай короче» замечает тот
-        же вызов, и без него персонализация осталась бы только ручной.
+        же вызов, и без него персонализация осталась бы только ручной. Свод — по
+        той же причине, но только НЕПУСТОЙ: пока правил нет, звать модель не за чем,
+        а первое правило всё равно вносит человек или инструмент.
         """
-        return self._long_on or self.working or self._persona is not None
+        return self._long_on or self.working or self._persona is not None or bool(self._book)
 
     def _save(
         self,
@@ -1434,6 +1572,10 @@ class Agent:
         # переживёт даже «забыть разговор».
         if self._persona is not None and self._persona_update.changes:
             self.store.save_persona(self._persona.row())
+        # Свод правил — тем более отдельно: он не принадлежит ни разговору, ни ветке,
+        # ни даже этому агенту.
+        if self._guard.changes:
+            self._persist_rules()
 
     def _usage_row(self, report: TokenReport, totals: _Totals, shadow: Shadow | None = None) -> dict:
         """Расход обращения одной строкой — то, из чего потом рисуется рост цены."""
@@ -1465,6 +1607,9 @@ class Agent:
             "task_items": report.task_items,
             "persona_tokens": report.breakdown.persona,
             "persona": report.persona_id,
+            "invariant_tokens": report.breakdown.invariants,
+            "invariant_items": report.invariant_items,
+            "invariant_blocked": int(self._guard.blocked),
         }
 
     def _trim_memory(self) -> None:
@@ -1647,7 +1792,7 @@ class Agent:
         update.version = self._long.version
         update.long_items = len(self._long.notes)
         update.long_tokens = tokens.measure_text(
-            self._long_block() + self._invariants_block(), self.model)
+            self._long_block(), self.model)
         update.task_tokens = tokens.measure_text(self._task_block(), self.model)
         update.task = self._task.to_dict() if self._task else None
         update.elapsed_s = round(time.perf_counter() - started, 3)
@@ -1675,13 +1820,24 @@ class Agent:
         по-прежнему не знает.
         """
         personal = self._persona is not None
+        lawful = bool(self._book)
+        # Правила и схему приносят сами сущности, а склеивает их агент: модель
+        # памяти по-прежнему не знает ни про профиль, ни про свод правил.
+        extra_rules = ((persona.router_rules() if personal else "")
+                       + (invariants.router_rules() if lawful else ""))
+        extra_schema = ", ".join(part for part in (
+            persona.ROUTER_SCHEMA if personal else "",
+            invariants.ROUTER_SCHEMA if lawful else "") if part)
+        extra_input = "\n\n".join(part for part in (
+            persona.router_input(self._persona) if personal else "",
+            invariants.router_input(self._book) if lawful else "") if part)
         try:
             raw = totals.add(self._call(
                 memory.router_messages(
                     self.profile.name, self._task, self._long, batch,
-                    extra_rules=persona.router_rules() if personal else "",
-                    extra_schema=persona.ROUTER_SCHEMA if personal else "",
-                    extra_input=persona.router_input(self._persona),
+                    extra_rules=extra_rules,
+                    extra_schema=extra_schema,
+                    extra_input=extra_input,
                 ),
                 None,
                 temperature=config.ROUTER_TEMPERATURE,
@@ -1716,6 +1872,18 @@ class Agent:
                 )
                 self._persona_update.changes.extend(changes)
                 self._persona_update.rejected.extend(rejected)
+        if lawful:
+            # Свод приходит частями, как профиль: «не упомянул» значит «не менять».
+            # Правило — закон проекта, и забывчивость модели не должна его отменять;
+            # отмена всегда явная (drop), и её тоже видно в трассе.
+            wanted = invariants.parse_update(parsed.get("raw"))
+            if wanted:
+                changes, rejected = invariants.merge(
+                    self._book, wanted, self.turns, source="router",
+                    locked=invariants.locked_by(self._guard.changes),
+                )
+                self._guard.changes.extend(changes)
+                self._guard.rejected.extend(rejected)
         if self._long_on and parsed["long"]:
             update.routes.extend(memory.merge_long(self._long, parsed["long"], self.turns))
         if self.working:
@@ -2049,6 +2217,46 @@ class Agent:
             return
         self._persona = persona.Persona.from_row(row)
 
+    def _load_invariants(self) -> None:
+        """Поднять свод нерушимых правил из хранилища.
+
+        Свод общий, поэтому читается не из ветки, а из своей таблицы. Если строк в
+        ней ещё нет, а в долговременной памяти лежат инварианты дня 11 — они и
+        становятся сводом: терять правила пользователя ради чистоты модели незачем.
+        Вид записям там взять неоткуда, поэтому все приходят техническими решениями,
+        а маршрутизатор разложит их точнее при первом же обращении.
+        """
+        if self.store is None:
+            return
+        rows = self.store.invariants()
+        if rows:
+            self._book = invariants.book_from_rows(rows)
+            return
+        legacy = invariants.rules_from_notes(self.store.legacy_invariants())
+        if legacy:
+            self._book = invariants.Book(rules=legacy)
+            self._persist_rules()
+            logger.info("Агент [%s]: свод правил поднят из инвариантов долговременной памяти — %d правил(о)",
+                        self.id, len(legacy))
+            return
+        self._book = invariants.Book()
+
+    def _persist_rules(self) -> None:
+        """Записать свод целиком: правила, которых в нём больше нет, удаляются.
+
+        Отдельно от обращения, как и профиль: правило не принадлежит ни разговору,
+        ни ветке. Сверка с базой нужна из-за отмены — правило может убрать и
+        человек в окне, и маршрутизатор по просьбе «это правило больше не
+        действует».
+        """
+        if self.store is None:
+            return
+        known = {row["id"] for row in self.store.invariants()}
+        for rule in self._book.rules:
+            self.store.save_invariant(rule.row())
+        for rule_id in known - {rule.id for rule in self._book.rules}:
+            self.store.remove_invariant(rule_id)
+
     def _load_task(self) -> None:
         """Поднять открытую задачу ветки: рабочая память тоже переживает перезапуск."""
         if self.store is None:
@@ -2269,6 +2477,48 @@ class Agent:
                     self.profile.name, self.id, fresh.name, fresh.id)
         return fresh
 
+    # ------------------------------------------------- нерушимые правила --
+
+    @property
+    def book(self) -> "invariants.Book":
+        """Свод нерушимых правил, действующий для этого агента (он же общий для всех)."""
+        return self._book
+
+    def rules(self) -> list[dict]:
+        """Правила свода записями — их показывают панель и окно правки."""
+        return [rule.to_dict() for rule in self._book.rules]
+
+    def edit_rule(self, values: dict) -> dict:
+        """Завести правило или поправить существующее: человек правит руками.
+
+        Тот же вход и для нового правила, и для правки: правило со ссылкой `id`
+        меняется на месте. Проверки — в модуле правил, а не в окне: неизвестный вид
+        и пустое название отсюда уходят `AgentError`, и окно только показывает текст.
+        """
+        try:
+            change = invariants.apply_values(self._book, values)
+        except ValueError as e:
+            raise AgentError(str(e)) from e
+        self._persist_rules()
+        logger.info("Агент «%s» [%s]: свод правил правлен руками — %s",
+                    self.profile.name, self.id, change.what)
+        return change.to_dict()
+
+    def remove_rule(self, rule_id: str) -> dict:
+        """Убрать правило из свода: снятая человеком рамка перестаёт действовать.
+
+        Единственный способ отменить правило окончательно — и он у человека:
+        разговором правило не отменяется, об этом прямо сказано модели в своде.
+        """
+        try:
+            change = invariants.remove(self._book, rule_id)
+        except ValueError as e:
+            raise AgentError(str(e)) from e
+        self._persist_rules()
+        logger.info("Агент «%s» [%s]: правило убрано из свода — %s",
+                    self.profile.name, self.id, change.what)
+        return change.to_dict()
+
     def set_profile(
         self,
         name: str | None = None,
@@ -2301,7 +2551,9 @@ class Agent:
 
         Профиль пользователя здесь не трогаем: он описывает человека, а не разговор,
         и общий для всех агентов — стирать его вместе с перепиской значило бы
-        заставить заново рассказывать о себе после каждой очистки.
+        заставить заново рассказывать о себе после каждой очистки. Свод нерушимых
+        правил — тем более: правила проекта не кончаются вместе с разговором, и
+        снять их может только человек в своде.
         """
         self._memory.clear()
         self._pending_summary.clear()
@@ -2412,7 +2664,7 @@ class Agent:
         расхождению между картой и реальностью взяться неоткуда.
         """
         summary_block = self._summary_block()
-        long_block = self._long_block() + self._invariants_block()
+        long_block = self._long_block()
         task_block = self._task_block()
         history = self.history_size
         task = self._task
@@ -2626,6 +2878,7 @@ class Agent:
         agent._load_long()      # долговременная память раньше очередей: от её границы зависит очередь
         agent._load_task()
         agent._load_persona()   # профиль вне переписки, но нужен до сборки первого запроса
+        agent._load_invariants()    # свод правил — тоже вне переписки и тоже нужен сразу
         agent._load_memory()
         logger.info(
             "Агент «%s» [%s] восстановлен: %d обращений, ветка «%s», стратегия %s, сжатие %s · слои: "
@@ -2688,12 +2941,14 @@ class Agent:
         """
         specs = self._specs()
         summary_block = self._summary_block()
-        long_block = self._long_block() + self._invariants_block()
+        long_block = self._long_block()
         task_block = self._task_block()
         persona_block = self._persona_block()
+        rules_block = self._invariants_block()
         breakdown = tokens.measure(
             self._system_prompt([]), self._memory, "", specs, self.model,
             summary=summary_block, long=long_block, task=task_block, persona=persona_block,
+            invariants=rules_block,
         )
         limit = self._context_limit()
         history = self.transcript()
@@ -2743,9 +2998,14 @@ class Agent:
             "task_active": bool(task_block),
             "task_tokens": breakdown.task,
             "long": self._long.to_dict(),
-            "invariants": [note.to_dict() for note in self._long.invariants()],
             "long_active": bool(long_block),
             "long_tokens": breakdown.long,
+            # Свод нерушимых правил: не слой памяти и не профиль, а рамки работы.
+            # Он не зависит ни от стратегии, ни от тумблеров — только от того,
+            # задали правила или нет.
+            "invariants": self._book.to_dict(),
+            "invariants_active": bool(rules_block),
+            "invariants_tokens": breakdown.invariants,
             # Профиль пользователя: не слой памяти, но такая же часть запроса —
             # и стоит он в каждом обращении одинаково.
             "persona": self._persona.to_dict() if self._persona else None,
@@ -2811,8 +3071,9 @@ class Agent:
             "task": self._task.to_dict() if self._task else None,
             "task_active": bool(self._task_block()),
             "long": self._long.to_dict(),
-            "invariants": [note.to_dict() for note in self._long.invariants()],
-            "long_active": bool(self._long_block() or self._invariants_block()),
+            "long_active": bool(self._long_block()),
+            "invariants": self._book.to_dict(),
+            "invariants_active": bool(self._invariants_block()),
             # Персонализация: какой профиль подключён к каждому запросу и во что
             # он обходится. Список профилей интерфейс берёт отдельно (`personas`) —
             # в паспорте он был бы лишним походом в базу на каждую перерисовку.
@@ -2820,6 +3081,7 @@ class Agent:
             "persona_id": self.persona_id,
             "persona_active": self._persona is not None,
             "persona_tokens": tokens.measure_text(self._persona_block(), self.model),
+            "invariants_tokens": tokens.measure_text(self._invariants_block(), self.model),
             "states": config.TASK_STATES,
             "route_pending": len(self._pending_route),
             "pending_messages": len(self._pending_summary),
@@ -2828,7 +3090,8 @@ class Agent:
             "branch_origin": self._branch["origin"],
             "branch_shared": self._branch["shared"],
             "tools": (tools.catalog() + memory.tool_catalog(self._long_on, self.working)
-                      + persona.tool_catalog(self._persona is not None)),
+                      + persona.tool_catalog(self._persona is not None)
+                      + invariants.tool_catalog(True)),
             "workspace": str(tools.workspace()),
             # Память между запусками: сколько сохранено, где лежит и когда говорили
             "history_messages": self.history_size,
