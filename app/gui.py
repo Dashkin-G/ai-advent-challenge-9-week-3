@@ -301,6 +301,15 @@ QLabel#stateCaption {{ color: {TASK}; font-size: 11px; font-weight: 700; letter-
 QLabel#stateArrow {{ color: {MUTED}; font-size: 13px; }}
 QLabel#stateProgress {{ color: {MUTED}; font-size: 11px; }}
 QLabel#stateExpect {{ color: {TASK}; font-size: 11px; }}
+/* Условие перехода: пока оно не выполнено, следующий этап не наступит — поэтому
+   строка отличается от остальных и читается как «чего ждёт автомат». */
+QLabel#stateGate {{ color: {MUTED}; font-size: 11px; }}
+/* Отклонённая попытка перехода: прыжок через этап или невыполненное условие.
+   Цвет запрета — тот же, что у нарушенных правил: это отказ, а не подсказка. */
+QLabel#gateMarker {{
+    color: {RULES}; font-size: 12px; font-weight: 700;
+    border: 1px solid {ERR_LINE}; border-radius: 8px; padding: 4px 10px;
+}}
 QFrame#stateItem {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 8px; }}
 QFrame#stateItemActive {{ background: #2a1f12; border: 1px solid {TASK}; border-radius: 8px; }}
 QFrame#stateItemLocked {{ background: {BLACK}; border: 1px dashed {LINE}; border-radius: 8px; }}
@@ -1117,6 +1126,14 @@ class TokensDialog(QDialog):
         persona_note.setObjectName("subtitle")
         persona_note.setWordWrap(True)
         lay.addWidget(persona_note)
+
+        # Автомат задачи: цена у него нулевая, а работа видна только по отказам —
+        # поэтому раздел и считает попытки, а не токены.
+        lay.addWidget(_section("АВТОМАТ ЗАДАЧИ: ПЕРЕХОДЫ И ОТКАЗЫ"))
+        states_note = QLabel(_states_text(agent, rows))
+        states_note.setObjectName("subtitle")
+        states_note.setWordWrap(True)
+        lay.addWidget(states_note)
 
         lay.addWidget(_section("СТРАТЕГИЯ КОНТЕКСТА: ДО И ПОСЛЕ"))
         strategy_note = QLabel(_strategy_text(state, rows))
@@ -2383,21 +2400,26 @@ class AgentWindow(QMainWindow):
         state_lines.addWidget(self.state_progress, 1)
         self.state_expect = ElidedLabel("stateExpect")
         state_lines.addWidget(self.state_expect, 1)
+        # Четвёртая подпись — условие перехода: то, без чего следующий этап не
+        # наступит. Таблица переходов отвечает «куда можно», условие — «когда», и
+        # человеку важнее второе: именно оно объясняет, почему автомат стоит.
+        self.state_gate = ElidedLabel("stateGate")
+        state_lines.addWidget(self.state_gate, 1)
         self.pause_btn = QPushButton("Пауза")
         self.pause_btn.setObjectName("branchAction")
         self.pause_btn.setCursor(Qt.PointingHandCursor)
         self.pause_btn.clicked.connect(self._toggle_pause)
         state_row.addWidget(self.pause_btn)
-        self.close_task_btn = QPushButton("Завершить задачу")
-        self.close_task_btn.setObjectName("branchAction")
-        self.close_task_btn.setCursor(Qt.PointingHandCursor)
-        self.close_task_btn.setToolTip(
-            "Перевести задачу на этап «Готово». Правила те же, что у модели:\n"
-            "с этапа планирования агент откажет и скажет, куда перейти можно.\n"
-            "Итог завершённой задачи останется в долговременной памяти."
-        )
-        self.close_task_btn.clicked.connect(self._close_task)
-        state_row.addWidget(self.close_task_btn)
+        # Второе (и последнее) действие человека в автомате — подтвердить условие
+        # текущего этапа и двинуть задачу дальше. Кнопка контекстная: с планирования
+        # она утверждает план, с проверки принимает результат. Прыгнуть ею нельзя —
+        # до дня 15 здесь была «Завершить задачу», которая прокручивала оставшиеся
+        # этапы разом, то есть делала ровно то, что задание запрещает.
+        self.advance_btn = QPushButton("Утвердить план")
+        self.advance_btn.setObjectName("branchAction")
+        self.advance_btn.setCursor(Qt.PointingHandCursor)
+        self.advance_btn.clicked.connect(self._advance_task)
+        state_row.addWidget(self.advance_btn)
         self.state_bar.hide()
         lay.addWidget(self.state_bar)
 
@@ -2772,6 +2794,19 @@ class AgentWindow(QMainWindow):
                 broken.setStyleSheet(f"color: {ERR_TEXT}; font-size: 11px; background: transparent;")
                 outer.addWidget(broken)
 
+            # Попытка перепрыгнуть этап — событие того же веса, что нарушенное
+            # правило: состояние задачи осталось прежним, и об этом надо сказать
+            # прямо, иначе «агент просто отказался» выглядит как его настроение.
+            if t.state_asked or t.state_blocked:
+                jumped = _wrapped(
+                    (f"⛔ переход отклонён — {t.state_asked}. " if t.state_asked else
+                     f"⛔ код отклонил попыток перехода: {t.state_blocked}. ")
+                    + "Состояние задачи не изменилось: порядок этапов держит таблица переходов, "
+                      "а не согласие модели.", "meta",
+                )
+                jumped.setStyleSheet(f"color: {ERR_TEXT}; font-size: 11px; background: transparent;")
+                outer.addWidget(jumped)
+
             # Расхождение с профилем — такой же факт, как нарушенный инвариант:
             # требование ушло в запрос и всё равно не выполнено. Ответ не
             # перегенерируется, но молчать об этом нельзя.
@@ -2893,6 +2928,7 @@ class AgentWindow(QMainWindow):
                 f"{(m.task_action or 'без изменений') if m.task else 'не заведена'}"
                 f"{f' ≈ {_num(m.task_tokens)} т.' if m.task_tokens else ''}"
                 + (f"  ·  этапы: {path}" if path else "")
+                + (f"  ·  условия: {', '.join(m.gates)}" if m.gates else "")
                 + (f"  ·  {m.paused}" if m.paused else "")
                 + f"  ·  по {m.messages} сообщ.  ·  {how}"
             )
@@ -3459,6 +3495,28 @@ class AgentWindow(QMainWindow):
                 f"⏸ {data['moved']}  ·  {config.note_source_label(data['source'])}",
                 "stateMarker",
             )
+            return
+        if kind == "gate":
+            # Условие перехода подтверждено: сам по себе этап от этого не меняется,
+            # но без отметки он бы и не сменился — событие стоит показать отдельно.
+            task = data["task"]
+            self._render_states(task)
+            self.chat.add_marker(
+                f"✓ условие выполнено: {data['gate']}  ·  "
+                f"{config.note_source_label(data['source'])}",
+                "stateMarker",
+            )
+            return
+        if kind == "state_block":
+            # Попытка перепрыгнуть этап, найденная в самом запросе — ДО ответа.
+            # Показываем сразу: отказ агента в ответе станет понятен, когда видно,
+            # на чём он основан.
+            blocked = data["blocked"]
+            self._set_status(WARN, "переход отклонён")
+            self.chat.add_marker(
+                f"⛔ попытка перейти на «{blocked['target_label']}»: {blocked['reason']}",
+                "gateMarker",
+            )
 
     def _on_reply(self, reply: AgentReply) -> None:
         self._pending.set_text(reply.text)
@@ -3596,13 +3654,15 @@ class AgentWindow(QMainWindow):
         # пользователя по скриншоту).
         exit_rule = config.state_exit(task["state"])
         paused = bool(task.get("paused"))
+        gate = task.get("gate") or {}
         self._state_text(
-            progress=f"шаг {task['step']} из {task['total']} · {_oneline(task['current'], 45)}"
-            + (f" · дальше: {exit_rule}" if exit_rule else " · это последний этап"),
+            progress=f"шаг {task['step']} из {task['total']} · {_oneline(task['current'], 45)}",
             # Номер обращения и объяснение паузы — в подсказке: в строке важнее всего,
             # чьего хода ждут.
             expect=(f"⏸ пауза · ждём: {_oneline(task['expect'], 44)}" if paused else
                     f"ждём: {_oneline(task['expect_line'], 52)}"),
+            gate=(f"условие: {gate['label']} — {'выполнено' if gate['ready'] else 'нет'}"
+                  if gate else "условие: переход дальше без условий"),
         )
         self.state_progress.setToolTip(
             f"Сейчас: {task['current']}\n"
@@ -3610,6 +3670,17 @@ class AgentWindow(QMainWindow):
             + "Этапы агент проходит сам: код двигает автомат по факту работы,\n"
               "маршрутизатор — по смыслу разговора, а порядок проверяет таблица\n"
               "переходов. Переключать этапы руками не нужно."
+        )
+        self.state_gate.setToolTip(
+            (f"Условие перехода «{config.state_label(task['state'])}» → "
+             f"«{gate['target_label']}»: {gate['label']}.\n"
+             + (f"Выполнено — переход разрешён.\n" if gate["ready"] else f"{gate['why']}\n")
+             + "\nТаблица переходов отвечает, куда из этапа можно уйти; условие — когда.\n"
+               "Пока оно не выполнено, код не переведёт задачу дальше ни по просьбе\n"
+               "модели, ни по кнопке: «нельзя делать реализацию до утверждённого плана»."
+             if gate else
+             "У перехода с этого этапа условий нет: он проверяется только таблицей\n"
+             "разрешённых переходов.")
         )
         # Третья величина состояния — ожидаемое действие. На паузе она же объясняет,
         # почему ничего не происходит: ход за человеком, и до его слова автомат замер.
@@ -3623,6 +3694,20 @@ class AgentWindow(QMainWindow):
              "Ожидаемое действие: что должно произойти дальше и от кого этого ждут.\n"
              "Считает код по этапу и шагу, маршрутизатор может уточнить формулировку.")
         )
+        # Кнопка действия остаётся видимой и на паузе, хотя там она получит отказ:
+        # человек в автомате не привилегированный, и отказ должно быть видно, а не
+        # спрятано в неактивной кнопке (правило дня 11).
+        act = config.state_act(task["state"])
+        self.advance_btn.setVisible(bool(act))
+        if act:
+            self.advance_btn.setText(act["label"])
+            self.advance_btn.setToolTip(
+                f"{act['hint']}: задача перейдёт на этап «{config.state_label(act['to'])}».\n"
+                + (f"Кнопка ставит отметку «{gate['label']}» — без неё код переход не выполнит.\n"
+                   if gate else "")
+                + "Правила те же, что у модели: подтверждать нечего или этап не тот —\n"
+                  "кнопка получит тот же отказ. Прыгнуть через этап ею нельзя."
+            )
         self.pause_btn.setText("Продолжить" if paused else "Пауза")
         self.pause_btn.setToolTip(
             "Вернуться к отложенной задаче: карточка снова уйдёт в запрос целиком,\n"
@@ -3632,7 +3717,8 @@ class AgentWindow(QMainWindow):
             "а карточка перестанет занимать контекст — останется закладка в строку."
         )
 
-    def _state_text(self, progress: str | None = None, expect: str | None = None) -> None:
+    def _state_text(self, progress: str | None = None, expect: str | None = None,
+                    gate: str | None = None) -> None:
         """Записать строки полосы этапов, вписав их в фактическую ширину.
 
         Места здесь мало: чипы четырёх этапов и две кнопки съедают ширину. Подписи
@@ -3643,6 +3729,8 @@ class AgentWindow(QMainWindow):
             self.state_progress.setFullText(progress)
         if expect is not None:
             self.state_expect.setFullText(expect)
+        if gate is not None:
+            self.state_gate.setFullText(gate)
 
     def _toggle_pause(self) -> None:
         """Отложить задачу или вернуться к ней — второе действие человека в автомате.
@@ -3668,24 +3756,28 @@ class AgentWindow(QMainWindow):
         folder.mkdir(parents=True, exist_ok=True)   # до первого файла папки может не быть
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
-    def _close_task(self) -> None:
-        """Единственное действие человека в автомате: «всё, дело закрыто».
+    def _advance_task(self) -> None:
+        """Подтвердить условие этапа и двинуть задачу на следующий — ход человека.
 
-        Этапы агент проходит сам, поэтому переключать их руками незачем — но
-        поставить точку человек должен уметь. Кнопка прокручивает оставшиеся этапы
-        по порядку (не перепрыгивая) и показывает пройденный путь.
+        Кнопка не прыгает через этапы: она подтверждает ровно то условие, которого
+        ждёт текущий этап, и просит ровно один переход. Отказ (плана нет, задача на
+        паузе) показывается как есть — человек здесь не привилегированный, и это
+        видно.
         """
         try:
-            result = self.agent.close_task()
+            result = self.agent.advance_task()
         except AgentError as e:
             self.chat.add_bubble(str(e), "error")
             return
         card = result["task"]
-        path = " → ".join(result["moved"]) if result["moved"] else "этап уже был последним"
-        self.chat.add_system(
-            f"⚙ задача «{card['title']}» завершена ({path}). Карточка ушла в архив и больше не "
-            f"занимает контекст, а её итог остался записью в долговременной памяти."
-        )
+        path = " → ".join(result["moved"]) if result["moved"] else "этап остался прежним"
+        mark = f"условие подтверждено: {', '.join(result['gates'])}  ·  " if result["gates"] else ""
+        self.chat.add_marker(f"⚙ {mark}{path}  ·  решение человека", "stateMarker")
+        if not card["open"]:
+            self.chat.add_system(
+                f"⚙ задача «{card['title']}» завершена. Карточка ушла в архив и больше не "
+                f"занимает контекст, а её итог остался записью в долговременной памяти."
+            )
         self._refresh()
 
     def _reset(self) -> None:
@@ -3805,27 +3897,32 @@ def _history_table(agent: Agent, history: list[dict]) -> QPlainTextEdit:
     tasks = agent.tasks()
     lines += [
         "",
-        "sqlite> SELECT id, status, state, paused, expect, title, turn, closed_turn, steps",
+        "sqlite> SELECT id, status, state, gates, log, paused, expect, title, turn, steps",
         f"        FROM tasks WHERE agent_id = '{agent_id}' AND branch = {branch} ORDER BY id;",
         "",
-        f"{'id':>4}  {'status':<7}  {'state':<11}  {'пауза':<6}  {'title':<20}  пункты",
-        f"{'-' * 4}  {'-' * 7}  {'-' * 11}  {'-' * 6}  {'-' * 20}  {'-' * 40}",
+        f"{'id':>4}  {'status':<7}  {'state':<11}  {'gates':<14}  {'title':<18}  пункты",
+        f"{'-' * 4}  {'-' * 7}  {'-' * 11}  {'-' * 14}  {'-' * 18}  {'-' * 36}",
     ]
     for row in tasks:
         items = (f"шагов {len(row['steps'])}, находок {len(row['findings'])}, "
                  f"файлов {len(row['artifacts'])}, вопросов {len(row['questions'])}")
         lines.append(f"{row['id']:>4}  {row['status']:<7}  {row['state']:<11}  "
-                     f"{('да' if row['paused'] else 'нет'):<6}  "
-                     f"{_oneline(row['title'], 20):<20}  {items}")
+                     f"{(','.join(row.get('gates') or []) or '—'):<14}  "
+                     f"{_oneline(row['title'], 18):<18}  {items}")
         if row["open"]:
-            lines.append(f"      обращение {row['turn']}, ждём: {row['expect_line']}")
+            lines.append(f"      обращение {row['turn']}, ждём: {row['expect_line']}"
+                         + (", НА ПАУЗЕ" if row["paused"] else ""))
+        if row.get("log"):
+            refused = sum(1 for item in row["log"] if not item.get("ok"))
+            lines.append(f"      log: попыток перехода {len(row['log'])}, из них отклонено {refused}")
     if not tasks:
         lines.append("-- строк нет: задач не было")
     else:
         lines += ["", "-- РАБОЧАЯ ПАМЯТЬ: по строке на задачу. В запрос уходит только та, у которой",
                   "-- status = open; закрытые остаются архивом и контекст не занимают. Состояние",
                   "-- задачи лежит колонками: state — этап автомата, expect/expect_who — ожидаемое",
-                  "-- действие, paused — отложена ли она (этап при этом сохраняется)."]
+                  "-- действие, paused — отложена ли она (этап при этом сохраняется), gates —",
+                  "-- выполненные условия переходов, log — журнал попыток вместе с отклонёнными."]
 
     people = agent.personas()
     active = agent.passport()["persona_id"]
@@ -4025,6 +4122,19 @@ def _layers_page(state: dict, tasks: list[dict]) -> QWidget:
             lines.append(f"    {open_task['bookmark']}")
         lines.append(f"  разрешённые переходы: {allowed} — остальные код отклонит"
                      + (" (и все, пока стоит пауза)" if open_task["paused"] else ""))
+        # Условие перехода — вторая половина закона: таблица отвечает «куда можно»,
+        # условие — «когда». Без него «реализация до утверждённого плана» была бы
+        # запрещена только на словах.
+        gate = open_task.get("gate") or {}
+        if gate:
+            lines.append(f"  условие перехода на «{gate['target_label']}»: {gate['label']} — "
+                         + ("выполнено" if gate["ready"] else "НЕ выполнено"))
+            if not gate["ready"]:
+                lines.append(f"    {gate['why']}")
+        else:
+            lines.append("  условие перехода: нет — с этого этапа переход только по таблице")
+        if open_task.get("gates"):
+            lines.append("  подтверждено: " + ", ".join(open_task["gates"]))
         lines.append(f"  в запрос на этом этапе уходит: "
                      + ("(ничего, задача на паузе)" if open_task["paused"] else
                         ', '.join(config.state_sections(open_task['state'])) or '(ничего)'))
@@ -4036,6 +4146,23 @@ def _layers_page(state: dict, tasks: list[dict]) -> QWidget:
         lines += ["", f"архив завершённых задач ({len(closed)}) — в запрос не уходят:"]
         lines += [f"  №{t['id']} «{t['title']}» — {t['summary']} (этап {t['state_label'].lower()}, "
                   f"обращение {t['closed_turn']})" for t in closed]
+
+    # Журнал переходов — ответ на пункт задания «проверьте попытки перейти в
+    # недопустимое состояние». Отклонённая попытка не меняет ничего, и без журнала
+    # от неё не осталось бы вообще никакого следа: ни в карточке, ни в переписке.
+    log = (open_task or (closed[-1] if closed else None) or {}).get("log") or []
+    lines += ["", f"ЖУРНАЛ ПЕРЕХОДОВ ({len(log)}) — в запрос не уходит, это след для человека"]
+    if not log:
+        lines.append("-- попыток ещё не было")
+    for item in log[::-1]:
+        mark = "✓" if item.get("ok") else "✕"
+        lines.append(
+            f"  {mark} обращение {item.get('turn', 0)} · "
+            f"{config.state_label(item.get('from', ''))} → {config.state_label(item.get('to', ''))} · "
+            f"{config.note_source_label(item.get('source', ''))}"
+        )
+        if not item.get("ok") and item.get("why"):
+            lines.append(f"      {item['why']}")
 
     view = QPlainTextEdit("\n".join(lines))
     view.setObjectName("raw")
@@ -4117,6 +4244,9 @@ def _layers_line(t) -> str:
                 f"шаг {t.task_step} из {t.task_total}; в запрос ушли только части карточки, нужные "
                 f"этому этапу — {_num(t.breakdown.task)} т."
                 + (f"; ждём: {t.task_expect}" if t.task_expect else "")
+                # Условие перехода — то, из-за чего автомат стоит или едет. Без него
+                # «этап не сменился» выглядит как сбой, а это работа закона.
+                + (f"; условие следующего этапа: {t.task_gate}" if t.task_gate else "")
                 + ("; это первый ответ после паузы — карточка вернулась целиком"
                    if t.task_resumed else ""))
     return "рабочая память: задачи нет — слой в запрос ничего не добавил"
@@ -4173,6 +4303,37 @@ def _rules_alarm(guard) -> str:
                 + " · ".join(item.what() for item in guard.conflicts)
                 + ". Агент знал об этом до генерации — отказ должен быть в самом ответе.")
     return ""
+
+
+def _states_text(agent, rows: list[dict]) -> str:
+    """Что автомат задачи сделал за разговор: сколько переходов и сколько отказов.
+
+    Считать тут нечего в токенах — и это главное, что раздел должен сказать:
+    проверка переходов стоит ноль, а видна она только по отклонённым попыткам.
+    """
+    tasks = agent.tasks()
+    log = [item for task in tasks for item in (task.get("log") or [])]
+    done = sum(1 for item in log if item.get("ok"))
+    refused = len(log) - done
+    blocked_turns = sum(1 for row in rows if row.get("state_blocked"))
+    if not log:
+        return (
+            "Переходов по этапам ещё не было: задача либо не заводилась, либо стоит на первом "
+            "этапе. Каждая попытка — и удачная, и отклонённая — попадёт в журнал карточки, а "
+            "проверка перехода не стоит ни одного токена: её делает код, а не модель."
+        )
+    return (
+        f"Попыток перехода: {len(log)} — применено {done}, отклонено {refused}"
+        + (f" на {blocked_turns} обращен(иях)" if blocked_turns else "")
+        + ". Отклонённая попытка не меняет ничего: состояние задачи остаётся прежним, а запись "
+          "о ней остаётся в журнале — иначе от неё не было бы следа.\n"
+        "Стоит это ноль токенов: таблица переходов и условия проверяются кодом до и после ответа. "
+        "Дорожает разговор от другого — от карточки задачи в запросе и от вызова маршрутизатора, "
+        "который советует этап; сам отказ бесплатен.\n"
+        "Условия переходов: " + "; ".join(
+            f"{src} → {dst} только при «{guard['label']}»"
+            for (src, dst), guard in config.TASK_GUARDS.items()) + "."
+    )
 
 
 def _rules_text(state: dict, rows: list[dict]) -> str:
@@ -4453,7 +4614,10 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
             f"{'*' if row.get('invariant_blocked') else ' '}{row.get('persona_tokens') or 0:>8} "
             f"{row.get('summary_tokens') or 0:>12} "
             f"{row.get('long_tokens') or row.get('facts_tokens') or 0:>8} "
-            f"{row.get('task_tokens') or 0:>6} "
+            f"{row.get('task_tokens') or 0:>6}"
+            # Звёздочка у веса задачи — отклонённый переход на этом обращении: код не
+            # дал автомату сдвинуться, и по строке расхода это тоже должно быть видно.
+            f"{'*' if row.get('state_blocked') else ' '}"
             f"{row.get('folded_messages') or 0:>6} {row.get('dropped_messages') or 0:>8} "
             f"{estimated:>8} {error:>7}"
         )
@@ -4467,7 +4631,8 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
             "-- нём занял свод нерушимых правил (звёздочка рядом — в этом обращении ответ модели был",
             "-- заблокирован и пользователь получил отказ), «профиль» — сколько",
             "-- в нём занял профиль пользователя (он платится в каждом запросе), «суммаризация»,"
-            "-- «долгоср.» и «задача» — сколько в нём заняли блоки слоёв памяти, «вместо» — скольких",
+            "-- «долгоср.» и «задача» — сколько в нём заняли блоки слоёв памяти (звёздочка у задачи —",
+            "-- в этом обращении код отклонил переход по этапам), «вместо» — скольких",
             "-- сообщений вместо суммаризация, «за окном» — сколько сообщений истории не ушло дословно,",
             "-- «оценка» — что счётчик обещал до отправки. «+сум» у стратегии — в этом обращении поверх",
             "-- неё было включено сжатие истории.",

@@ -68,6 +68,9 @@ TASK_NOTE = (
     "переходы проверяет код агента, и запрещённый переход он просто отклонит, как бы убедительно ты "
     "его ни попросил. Считаешь, что этап пройден, — скажи об этом в ответе и верни нужный этап в "
     "поле state, а решение примет агент.\n"
+    "У перехода на следующий этап бывает УСЛОВИЕ (строка ниже). Пока оно не выполнено, код этап не "
+    "сменит — ни по твоей просьбе, ни по кнопке. Просят пойти дальше, а условие не выполнено — "
+    "скажи об этом прямо и назови, чего не хватает, вместо того чтобы обещать переход.\n"
     "Состояние задачи — три строки ниже: ЭТАП (в какой фазе дело), ШАГ (где именно внутри плана) "
     "и ЖДЁМ (что должно произойти дальше и от кого этого ждут). Ход твой — делай; ход "
     "пользователя — скажи, чего ждёшь, и не топчись на месте.\n"
@@ -76,6 +79,7 @@ TASK_NOTE = (
     "[СЕЙЧАС] {current}\n"
     "[ЖДЁМ] {expect}\n"
     "[ДАЛЬШЕ] {exit}\n"
+    "[УСЛОВИЕ] {gate}\n"
     "[ЗАДАЧА]\n{task}\n"
     "{resume}{rule}"
 )
@@ -96,6 +100,27 @@ PAUSED_NOTE = (
     "ней не продолжай и о её содержимом не догадывайся. Скажут «продолжаем» — карточка вернётся "
     "целиком и работа пойдёт с того же шага."
 )
+
+# Блок про запрещённый переход. Уходит в инструкцию ДО генерации, когда в самом
+# запросе просят этап, которого код не даст: отказать должен ассистент своими
+# словами, а не строка в интерфейсе после ответа.
+GATE_NOTE = (
+    "\n\nПОПЫТКА ПЕРЕПРЫГНУТЬ ЭТАП: в сообщении просят перевести задачу на этап «{target}», а код "
+    "агента такой переход не выполнит — {reason}\n"
+    "Это не предмет спора и не твой выбор: порядок этапов держит таблица переходов, и попытка уже "
+    "отклонена — состояние задачи осталось прежним. Ответь честно: скажи, что перепрыгнуть этап "
+    "нельзя, объясни причину своими словами и назови, что для этого нужно ({need}). Не делай вид, "
+    "что перешёл, и не обещай перейти. По текущему этапу работать при этом продолжай."
+)
+
+# Коды условий переходов — плоским множеством, чтобы проверять чужие значения
+# (строку из базы, ответ маршрутизатора) одной операцией.
+_GATE_CODES = {guard["code"] for guard in config.TASK_GUARDS.values()}
+
+# Строки, в которых про переход как раз говорят «не надо». Без них «пока не
+# завершай» читалось бы как просьба завершить — та же оговорка, что у инвариантов.
+_SKIP_MARKERS = ("не надо", "не нужно", "не стоит", "рано ", "пока не", "не завершай",
+                 "не закрывай", "не пропускай", "нельзя", "не переходи")
 
 # Роль маршрутизатора. Он не отвечает пользователю и не рассуждает — он раскладывает
 # новое по слоям. Карточку задачи и долговременную память возвращает ЦЕЛИКОМ: так
@@ -125,6 +150,16 @@ ROUTER_SYSTEM = (
     "поле state тот этап, на котором задача должна оказаться после этого обмена. Запрещённый "
     "переход агент отклонит — не пытайся обойти это уговорами. Задача завершается только через "
     "этап done.\n"
+    "\n"
+    "УСЛОВИЯ ПЕРЕХОДОВ — у части переходов есть условие, и без него переход не применится, даже "
+    "если он разрешён таблицей:\n"
+    "{gates}\n"
+    "Подтверждает условие ПОЛЬЗОВАТЕЛЬ, а твоё дело — услышать это и вернуть код в поле gates. "
+    "«Утверждаю», «план принят», «приступаем», «давай делать» — это plan_approved. «Расхождений "
+    "нет», «всё верно», «принимаю результат», «заверши» после проверки — это checked. Ничего "
+    "такого в сообщениях не было — верни gates пустым: подтверждение придумывать нельзя, это не "
+    "формальность, а разрешение пользователя двигаться дальше.\n"
+    "Сейчас подтверждено: {gates_now}.\n"
     "{pause}"
     "Когда двигать этап:\n"
     "  planning → execution: план назван, утверждён или пользователь просит приступать;\n"
@@ -172,7 +207,7 @@ ROUTER_SYSTEM = (
     '{{"task": {{"status": "open|none", "state": "planning|execution|validation|done", '
     '"title": "...", "goal": "...", "current": "над чем работаем прямо сейчас", '
     '"steps": [{{"text": "...", "done": true}}], "findings": ["..."], "artifacts": ["..."], '
-    '"questions": ["..."], "paused": false, '
+    '"questions": ["..."], "paused": false, "gates": ["plan_approved"], '
     '"expect": {{"who": "agent|user", "what": "чего ждём дальше"}}}}, '
     '"long": {{"profile": {{"ключ": "значение"}}, "decisions": {{}}, "knowledge": {{}}}}'
     '{schema}}}'
@@ -282,6 +317,12 @@ class Task:
     этапе, и этап при этом сохраняется. Пока она стоит, автомат заморожен
     (`transition` откажет), карточка в запрос не уходит, а вместо неё едет
     короткая закладка `bookmark()`.
+
+    `gates` — какие условия переходов уже выполнены («план утверждён», «проверка
+    пройдена»). Таблица переходов отвечает, куда из этапа можно уйти, а этот
+    список — когда: без него «нельзя делать реализацию до утверждённого плана»
+    осталось бы просьбой в промпте. `log` — журнал попыток перехода вместе с
+    отклонёнными: отказ ничего не меняет, и без записи от него не осталось бы следа.
     """
     id: int = 0
     title: str = ""
@@ -294,6 +335,8 @@ class Task:
     paused: bool = False                                   # задача отложена, автомат заморожен
     paused_turn: int = 0                                   # на каком обращении отложена
     resuming: bool = False                                 # следующий ответ — первый после паузы
+    gates: list[str] = field(default_factory=list)         # выполненные условия переходов
+    log: list[dict] = field(default_factory=list)          # журнал попыток перехода, включая отклонённые
     steps: list[dict] = field(default_factory=list)        # [{"text": ..., "done": bool}]
     findings: list[str] = field(default_factory=list)      # добытые факты и промежуточные результаты
     artifacts: list[str] = field(default_factory=list)     # созданные файлы
@@ -411,6 +454,10 @@ class Task:
             "paused_turn": self.paused_turn,
             "resuming": self.resuming,
             "bookmark": self.bookmark(),
+            "gates": list(self.gates),
+            "gate": gate_state(self),
+            "act": act_for(self),
+            "log": [dict(item) for item in self.log],
             "steps": [dict(step) for step in self.steps],
             "findings": list(self.findings),
             "artifacts": list(self.artifacts),
@@ -442,6 +489,10 @@ class Task:
             paused=bool(row.get("paused")),
             paused_turn=int(row.get("paused_turn") or 0),
             resuming=bool(row.get("resuming")),
+            # Отметка о выполненном условии — такое же чужое значение, как этап:
+            # код, которого больше нет в реестре, держать в карточке незачем.
+            gates=[str(v) for v in _load_list(row.get("gates")) if str(v) in _GATE_CODES],
+            log=[dict(v) for v in _load_list(row.get("log")) if isinstance(v, dict)],
             steps=[s for s in _load_list(row.get("steps")) if isinstance(s, dict)],
             findings=[str(v) for v in _load_list(row.get("findings"))],
             artifacts=[str(v) for v in _load_list(row.get("artifacts"))],
@@ -466,6 +517,8 @@ class Task:
             "paused": int(self.paused),
             "paused_turn": self.paused_turn,
             "resuming": int(self.resuming),
+            "gates": json.dumps(self.gates, ensure_ascii=False),
+            "log": json.dumps(self.log[-config.TASK_LOG_LIMIT:], ensure_ascii=False),
             "steps": json.dumps(self.steps, ensure_ascii=False),
             "findings": json.dumps(self.findings, ensure_ascii=False),
             "artifacts": json.dumps(self.artifacts, ensure_ascii=False),
@@ -485,14 +538,113 @@ class TransitionError(Exception):
     """
 
 
-def transition(task: Task, target: str, turn: int = 0) -> str:
+@dataclass
+class Blocked:
+    """Попытка перевести задачу на этап, которого код не разрешит.
+
+    Находка рубежа ДО генерации: её делает `screen_transition`, разбирая сам
+    запрос, и стоит она ноль токенов. Нужна, чтобы «реакцию ассистента» на
+    запрещённый переход давал ассистент, а не строка в интерфейсе задним числом.
+    """
+    current: str              # этап, на котором задача сейчас
+    target: str               # куда просят перевести
+    kind: str                 # jump (через этап) / guard (условие) / paused
+    reason: str               # почему нельзя, человеческими словами
+    need: str = ""            # что должно случиться, чтобы стало можно
+
+    def what(self) -> str:
+        return (f"«{config.state_label(self.current)}» → «{config.state_label(self.target)}»: "
+                f"{self.reason}")
+
+    def to_dict(self) -> dict:
+        return {"current": self.current, "target": self.target, "kind": self.kind,
+                "current_label": config.state_label(self.current),
+                "target_label": config.state_label(self.target),
+                "reason": self.reason, "need": self.need, "what": self.what()}
+
+
+def gate(task: Task, source: str, target: str) -> tuple[str, str]:
+    """Условие перехода: выполнено ли оно и, если нет, почему.
+
+    Возвращает пару «чего не хватает» и «объяснение». Первое пусто — переход
+    разрешён; `fact` — не хватает наблюдаемого признака (плана ещё нет, шаги не
+    закрыты), и одним сообщением этого не изменишь; `mark` — признак есть, но
+    подтверждения не было.
+
+    Разделение не формальное: на нём держится честность рубежа до генерации.
+    «Приступаем» — это и просьба о переходе, и само утверждение плана, поэтому
+    ругаться на отсутствие отметки ДО ответа нельзя: её поставит этот же обмен.
+    А вот утвердить план, которого нет, нельзя никаким сообщением.
+    """
+    guard = config.guard_for(source, target)
+    if not guard:
+        return "", ""
+    if not _fact_ready(task, guard["fact"]):
+        return "fact", f"{guard['why']}. Сейчас не выполнено: {guard['need']}."
+    if guard["code"] not in task.gates:
+        return "mark", f"{guard['why']}. {guard['ask'][0].upper()}{guard['ask'][1:]}."
+    return "", ""
+
+
+def gate_state(task: Task) -> dict:
+    """Условие выхода с текущего этапа — для интерфейса и трассы."""
+    act = config.state_act(task.state)
+    target = act.get("to", "")
+    guard = config.guard_for(task.state, target) if target else {}
+    if not guard:
+        return {}
+    kind, why = gate(task, task.state, target)
+    return {"code": guard["code"], "label": guard["label"], "target": target,
+            "target_label": config.state_label(target), "need": guard["need"],
+            "ask": guard["ask"], "ready": not kind, "kind": kind, "why": why,
+            "done": guard["code"] in task.gates}
+
+
+def gate_line(task: Task) -> str:
+    """Условие перехода на следующий этап одной строкой — для инструкции агента."""
+    info = gate_state(task)
+    if not info:
+        return "переход дальше без условий"
+    if info["ready"]:
+        return (f"{info['label']} — выполнено, переход на «{info['target_label']}» разрешён")
+    return f"{info['label']} — НЕ выполнено. {info['why']}"
+
+
+def act_for(task: Task) -> dict:
+    """Что человек может сделать кнопкой, чтобы двинуть дело дальше (пусто — нечего).
+
+    Одно действие на этап, и оно идёт по закону: подтвердить условие выхода и
+    попросить переход. Прыгнуть им через этап нельзя — в этом вся разница с кнопкой
+    «завершить задачу», которая была до дня 15.
+    """
+    if not task.open or task.paused:
+        return {}
+    act = config.state_act(task.state)
+    if not act.get("to"):
+        return {}
+    guard = config.guard_for(task.state, act["to"])
+    kind, why = gate(task, task.state, act["to"])
+    return {"label": act["label"], "to": act["to"], "hint": act.get("hint", ""),
+            "code": guard.get("code", ""),
+            # Кнопка доступна, пока не хватает только подтверждения: утверждать
+            # план, которого нет, незачем — и объяснение к этому прилагается.
+            "ready": kind != "fact", "why": why if kind == "fact" else ""}
+
+
+def transition(task: Task, target: str, turn: int = 0, source: str = "router") -> str:
     """Перевести задачу на другой этап — или отказать, если переход запрещён.
 
     Это и есть разница между автоматом и просьбой в инструкции. Модель может
     попросить любой этап, и попросит: она услужлива по природе и охотно
     согласится «пропустить планирование». Но применяет переход код, и только если
-    он есть в `config.TASK_TRANSITIONS`. Текстовое правило в промпте при этом
-    остаётся — как первая линия, а не как единственная.
+    он есть в `config.TASK_TRANSITIONS` И выполнено условие перехода
+    (`config.TASK_GUARDS`). Текстовое правило в промпте при этом остаётся — как
+    первая линия, а не как единственная.
+
+    Проверок три, и они разные: таблица отвечает «куда можно», условие — «когда
+    можно», пауза — «сейчас нельзя никуда». Любая попытка, чем бы она ни кончилась,
+    попадает в журнал карточки: отклонённый переход ничего не меняет, и без записи
+    от него не осталось бы следа.
 
     Возвращает человекочитаемое описание перехода; при запрете бросает
     `TransitionError` с объяснением, куда из текущего этапа перейти можно.
@@ -509,26 +661,226 @@ def transition(task: Task, target: str, turn: int = 0) -> str:
         # Пауза проверяется тем же кодом и тем же исключением, что и запрещённый
         # переход: иначе «замороженный автомат» был бы просто просьбой в промпте, а
         # модель (или кнопка) двигала бы этапы отложенной задачи как ни в чём не бывало.
-        raise TransitionError(
+        raise _refuse(
+            task, target, turn, source,
             f"Задача на паузе ({task.bookmark()}): переход «{config.state_label(task.state)}» → "
-            f"«{config.state_label(target)}» не применён. Сначала продолжите работу."
+            f"«{config.state_label(target)}» не применён. Сначала продолжите работу.",
         )
     allowed = config.allowed_states(task.state)
     if target not in allowed:
         where = ", ".join(f"«{config.state_label(code)}»" for code in allowed) if allowed else "никуда"
-        raise TransitionError(
+        raise _refuse(
+            task, target, turn, source,
             f"Переход «{config.state_label(task.state)}» → «{config.state_label(target)}» запрещён: "
-            f"из этого этапа можно только {where}. Этапы нельзя перепрыгивать."
+            f"из этого этапа можно только {where}. Этапы нельзя перепрыгивать.",
+        )
+    kind, why = gate(task, task.state, target)
+    if kind:
+        raise _refuse(
+            task, target, turn, source,
+            f"Переход «{config.state_label(task.state)}» → «{config.state_label(target)}» "
+            f"не применён: {why}",
         )
     was = task.state
     task.state = target
     task.updated_at = time.time()
+    # Отметка о подтверждении принадлежит этапу, с которого уводит. Вернулись на
+    # этот этап — старое подтверждение больше не считается: план переигрывают, и
+    # утверждать его придётся заново. Иначе галочка ставилась бы один раз навсегда.
+    for code in config.guards_from(target):
+        if code in task.gates:
+            task.gates.remove(code)
     if target == "done":
         # Автомат и статус карточки — одно и то же событие: задача закрывается
         # только через этап done, и другого пути к status="done" нет.
         task.status = "done"
         task.closed_turn = turn
-    return f"{config.state_label(was)} → {config.state_label(target)}"
+    moved = f"{config.state_label(was)} → {config.state_label(target)}"
+    _log_move(task, was, target, turn, source, True, "")
+    return moved
+
+
+def approve(task: Task, code: str, turn: int = 0, source: str = "user") -> str:
+    """Отметить, что условие перехода выполнено: план утверждён, проверка пройдена.
+
+    Ставят её двое — человек кнопкой и маршрутизатор, услышав «утверждаю» или
+    «расхождений нет», — и путь у обоих один, как у паузы. Подтвердить можно
+    только условие выхода с ТЕКУЩЕГО этапа: «расхождений нет», сказанное на
+    планировании, не значит ничего, и запасать галочки впрок нельзя.
+
+    Возвращает описание события; пустая строка — отметка уже стояла.
+    """
+    code = str(code or "").strip()
+    if code not in _GATE_CODES:
+        raise TransitionError(f"Условия «{code}» не существует.")
+    if not task.open:
+        raise TransitionError("Задача завершена — подтверждать нечего.")
+    if task.paused:
+        raise TransitionError(
+            f"Задача на паузе ({task.bookmark()}): подтверждать условия отложенной задачи нельзя. "
+            "Сначала продолжите работу.")
+    if code not in config.guards_from(task.state):
+        owner = next((src for (src, _), guard in config.TASK_GUARDS.items()
+                      if guard["code"] == code), "")
+        codes = [item["code"] for item in config.TASK_STATES]
+        if owner in codes and task.state in codes and codes.index(owner) < codes.index(task.state):
+            # Подтверждение опоздало: этап, к которому оно относится, уже пройден.
+            # Так и бывает в живом разговоре — «план утверждаю, приступай» код
+            # разбирает сам, до ответа, а маршрутизатор возвращает то же самое
+            # обращением позже. Отказывать тут не за что: условие своё дело сделало.
+            return ""
+        raise TransitionError(
+            f"Условие «{_guard_by_code(code)['label']}» относится к этапу "
+            f"«{config.state_label(owner)}», а задача сейчас на этапе "
+            f"«{config.state_label(task.state)}».")
+    guard = _guard_by_code(code)
+    if not _fact_ready(task, guard["fact"]):
+        raise TransitionError(
+            f"Подтверждать нечего: {guard['need']} — этого ещё нет.")
+    if code in task.gates:
+        return ""
+    task.gates.append(code)
+    task.updated_at = time.time()
+    return guard["label"]
+
+
+def screen_transition(text: str, task: Task | None) -> "Blocked | None":
+    """Рубеж ДО генерации: не просит ли сам ЗАПРОС запрещённого перехода.
+
+    Стоит ноль токенов и срабатывает раньше всякой модели, поэтому агент успевает
+    объяснить отказ своими словами в том же ответе, а не задним числом строкой в
+    интерфейсе. Приём тот же, что у инвариантов дня 14, и та же оговорка: никакой
+    семантики, только обороты из реестра этапов.
+
+    Молчит, когда переход разрешён, — тогда и объяснять нечего, — и когда не
+    хватает лишь подтверждения: его как раз и даёт это сообщение.
+    """
+    if not text or task is None or not task.open:
+        return None
+    target = _asked_state(text)
+    if not target or target == task.state:
+        return None
+    if task.paused:
+        return Blocked(current=task.state, target=target, kind="paused",
+                       reason=f"задача отложена ({task.bookmark()}), автомат заморожен",
+                       need="сначала вернуться к работе: «продолжаем»")
+    allowed = config.allowed_states(task.state)
+    if target not in allowed:
+        where = ", ".join(f"«{config.state_label(code)}»" for code in allowed) if allowed else "никуда"
+        return Blocked(current=task.state, target=target, kind="jump",
+                       reason=f"через этап прыгать нельзя, из этого этапа можно только {where}",
+                       need=f"пройти этапы по порядку: {' → '.join(config.state_label(c) for c in _road(task.state, target))}")
+    kind, why = gate(task, task.state, target)
+    if kind == "fact":
+        guard = config.guard_for(task.state, target)
+        return Blocked(current=task.state, target=target, kind="guard",
+                       reason=why, need=guard["need"])
+    return None
+
+
+def screen_gates(text: str, task: Task | None) -> list[str]:
+    """Условия, которые пользователь подтверждает прямо в этом запросе — ДО ответа.
+
+    Тот же приём, что у рубежа переходов, и по той же причине: маршрутизатор
+    работает после ответа, и без этой проверки «утверждаю, приступай» двигало бы
+    этап с опозданием на целое обращение — агент успевал бы ответить «пока не
+    могу, план не утверждён» на сообщение, которым его как раз утвердили.
+
+    Подтверждается только условие выхода с ТЕКУЩЕГО этапа и только когда
+    наблюдаемый признак уже есть: обещать «расхождений нет» на планировании
+    бессмысленно, а утверждать нечего, пока нет плана.
+    """
+    if not text or task is None or not task.open or task.paused:
+        return []
+    usable = "\n".join(line for line in text.splitlines()
+                       if not any(marker in line.lower() for marker in _SKIP_MARKERS))
+    low = usable.lower().replace("ё", "е")
+    found = []
+    for code in config.guards_from(task.state):
+        if code in task.gates:
+            continue
+        guard = _guard_by_code(code)
+        if not _fact_ready(task, guard["fact"]):
+            continue
+        if any(phrase.replace("ё", "е") in low for phrase in guard.get("asks", ())):
+            found.append(code)
+    return found
+
+
+def gate_note(blocked: "Blocked | None") -> str:
+    """Блок инструкции про запрещённый переход (пусто, если запроса о нём не было)."""
+    if blocked is None:
+        return ""
+    return GATE_NOTE.format(target=config.state_label(blocked.target),
+                            reason=blocked.reason, need=blocked.need)
+
+
+def note_attempt(task: Task, blocked: "Blocked", turn: int = 0, source: str = "user") -> None:
+    """Записать в журнал попытку перехода, найденную в самом запросе.
+
+    Рубеж до генерации до `transition()` не доходит — он разбирает просьбу заранее,
+    и без этой записи самая наглядная попытка («переходи сразу в done») в журнале
+    бы не осталась.
+    """
+    _log_move(task, blocked.current, blocked.target, turn, source, False, blocked.reason)
+
+
+def _refuse(task: Task, target: str, turn: int, source: str, why: str) -> TransitionError:
+    """Записать отклонённую попытку в журнал и вернуть готовое исключение."""
+    _log_move(task, task.state, target, turn, source, False, why)
+    return TransitionError(why)
+
+
+def _log_move(task: Task, source_state: str, target: str, turn: int,
+              source: str, ok: bool, why: str) -> None:
+    """Запись в журнал переходов: кто, куда, получилось ли и почему нет."""
+    task.log.append({"turn": turn, "from": source_state, "to": target, "ok": ok,
+                     "source": source, "why": why, "at": time.time()})
+    del task.log[:-config.TASK_LOG_LIMIT]
+
+
+def _fact_ready(task: Task, fact: str) -> bool:
+    """Наблюдаемый признак условия: то, что код видит сам, без слов и подтверждений."""
+    if fact == "plan":
+        # Хотя бы один шаг: утверждать нечего, пока плана нет вовсе. Потолок повыше
+        # («не меньше двух») здесь не годится — задачу с одним шагом он запер бы на
+        # планировании навсегда, а от пустых карточек защищает другое правило.
+        return task.total >= 1
+    if fact == "steps_done":
+        return bool(task.steps) and all(step.get("done") for step in task.steps)
+    return True
+
+
+def _guard_by_code(code: str) -> dict:
+    """Условие перехода по коду отметки."""
+    return next((guard for guard in config.TASK_GUARDS.values() if guard["code"] == code), {})
+
+
+def _road(source: str, target: str) -> list[str]:
+    """Этапы по порядку от текущего до нужного — чтобы показать, что придётся пройти."""
+    codes = [item["code"] for item in config.TASK_STATES]
+    if source not in codes or target not in codes:
+        return []
+    start, finish = codes.index(source), codes.index(target)
+    return codes[start + 1:finish + 1] if finish > start else codes[finish:start]
+
+
+def _asked_state(text: str) -> str:
+    """Этап, на который просят перевести задачу (пусто — просьбы не было).
+
+    Берётся ПОСЛЕДНЕЕ совпадение по тексту: в «давай пропустим планирование и сразу
+    считай задачу выполненной» просьб две, и настоящая — та, что в конце.
+    """
+    usable = "\n".join(line for line in text.splitlines()
+                       if not any(marker in line.lower() for marker in _SKIP_MARKERS))
+    low = usable.lower().replace("ё", "е")
+    best, at = "", -1
+    for state in config.TASK_STATES:
+        for phrase in config.state_asks(state["code"]):
+            found = low.rfind(phrase.replace("ё", "е"))
+            if found > at:
+                best, at = state["code"], found
+    return best
 
 
 def pause(task: Task, turn: int = 0) -> str:
@@ -627,49 +979,57 @@ def overdue_state(task: Task) -> str:
     уже стояли выполненные шаги и созданные файлы. Отставание видно по объективным
     признакам, и код исправляет его сам, не спрашивая модель:
 
-        планирование → выполнение, если хоть один шаг отмечен выполненным или
-        появился артефакт: значит работа уже идёт, как бы этап ни назывался;
+        планирование → выполнение, когда план утверждён: отметка о подтверждении и
+        есть тот самый наблюдаемый признак, а работа без неё не начинается — в этом
+        и смысл условия «нельзя делать реализацию до утверждённого плана»;
         выполнение → проверка, когда план есть и все его шаги закрыты: работать
-        больше не по чему, остаётся сверить сделанное.
+        больше не по чему, остаётся сверить сделанное;
+        проверка → готово, когда результат принят: до дня 15 код этого перехода не
+        делал никогда, потому что «проверка прошла» не было наблюдаемо. Теперь
+        наблюдаемо: подтверждение — явная отметка в карточке, и ставит её человек
+        или маршрутизатор с его слов, а не сам код.
 
-    А вот завершение (проверка → готово) код сам не делает никогда: «проверка
-    прошла» — не наблюдаемый признак, и закрытая задача уходит из контекста. Это
-    решение остаётся за маршрутизатором и за человеком.
+    Условие перехода правило проверяет заранее (`gate`) и молчит, если оно не
+    выполнено: правило не «хочет» этап, оно догоняет факт, и отказ от него засорял
+    бы журнал попыток, где должны стоять настоящие попытки прыгнуть.
 
     На паузе правило молчит: отложенная задача не должна доезжать до следующего
     этапа сама, пока человек не вернулся к делу.
     """
     if not task.open or task.paused:
         return ""
+    target = ""
     if task.state == "planning":
-        if any(step.get("done") for step in task.steps) or task.artifacts:
-            return "execution"
+        target = "execution"
     elif task.state == "execution":
         if task.steps and all(step.get("done") for step in task.steps):
-            return "validation"
-    return ""
-
-
-def path_to_done(state: str) -> list[str]:
-    """Этапы, которые осталось пройти до «Готово», по порядку.
-
-    Нужно, чтобы «завершить задачу» было ОДНИМ действием человека, а не походом по
-    этапам руками. Порядок реестра линеен, и движение вперёд разрешено всегда,
-    поэтому путь — это просто хвост списка этапов после текущего.
-    """
-    codes = [item["code"] for item in config.TASK_STATES]
-    if state not in codes:
-        return []
-    return codes[codes.index(state) + 1:]
+            target = "validation"
+    elif task.state == "validation":
+        target = "done"
+    if not target or any(gate(task, task.state, target)):
+        return ""
+    return target
 
 
 def states_listing() -> str:
-    """Этапы автомата с их переходами — для инструкции маршрутизатора."""
+    """Этапы автомата с их переходами и условиями — для инструкции маршрутизатора."""
     lines = []
     for state in config.TASK_STATES:
         allowed = config.allowed_states(state["code"])
-        where = " → " + ", ".join(allowed) if allowed else " → (конец)"
-        lines.append(f"  {state['code']} ({state['en']}) — {state['what']};{where}")
+        where = []
+        for code in allowed:
+            guard = config.guard_for(state["code"], code)
+            where.append(f"{code} (только если {guard['label']})" if guard else code)
+        tail = " → " + ", ".join(where) if where else " → (конец)"
+        lines.append(f"  {state['code']} ({state['en']}) — {state['what']};{tail}")
+    return "\n".join(lines)
+
+
+def gates_listing() -> str:
+    """Условия переходов и то, чем они подтверждаются, — для инструкции маршрутизатора."""
+    lines = []
+    for (src, dst), guard in config.TASK_GUARDS.items():
+        lines.append(f"  {guard['code']} — {guard['label']} ({src} → {dst}); {guard['why']}")
     return "\n".join(lines)
 
 
@@ -711,12 +1071,13 @@ class MemoryUpdate:
     moved: list[str] = field(default_factory=list)
     paused: str = ""               # событие паузы за обращение: отложили или вернулись
     rejected: str = ""             # отклонённый переход: что попросила модель и почему нельзя
+    gates: list[str] = field(default_factory=list)   # условия, подтверждённые за обращение
     elapsed_s: float = 0.0
     call_tokens: int = 0
 
     def __bool__(self) -> bool:
         return bool(self.routes or self.task_action or self.moved or self.paused
-                    or self.rejected)
+                    or self.rejected or self.gates)
 
     def by_layer(self, layer: str) -> list[Route]:
         return [route for route in self.routes if route.layer == layer]
@@ -735,6 +1096,7 @@ class MemoryUpdate:
             "moved": list(self.moved),
             "paused": self.paused,
             "rejected": self.rejected,
+            "gates": list(self.gates),
             "elapsed_s": self.elapsed_s,
             "call_tokens": self.call_tokens,
         }
@@ -957,7 +1319,9 @@ def router_messages(
     return [
         {"role": "system", "content": ROUTER_SYSTEM.format(
             name=name, limit=config.LONG_LIMIT, items=config.TASK_ITEMS_LIMIT,
-            states=states_listing(), state=state,
+            states=states_listing(), state=state, gates=gates_listing(),
+            gates_now=(", ".join(_guard_by_code(code)["label"] for code in task.gates)
+                       if task is not None and task.gates else "ничего"),
             allowed=", ".join(allowed) if allowed else "никуда, задача завершена",
             pause=("Задача СЕЙЧАС НА ПАУЗЕ: этап не двигай и карточку не переписывай. Просит "
                    "продолжить — верни paused: false, и работа пойдёт с того же места.\n"
@@ -1053,6 +1417,11 @@ def _parse_task(raw: object) -> dict | None:
         "questions": _clean_list(raw.get("questions")),
         "expect": what,
         "expect_who": who if who in config.TASK_ACTORS else "",
+        # Что пользователь подтвердил в этом обмене: «утверждаю план», «расхождений
+        # нет». Это не переход — это отметка, без которой переход не состоится.
+        # Применяет её агент через `approve()`, и там же она может получить отказ.
+        "gates": [code for code in (str(v).strip() for v in _as_list(raw.get("gates")))
+                  if code in _GATE_CODES],
         # Пауза — поле с тремя значениями: да, нет и «маршрутизатор о ней не сказал».
         # Обычное булево с умолчанием False снимало бы паузу каждый раз, когда модель
         # просто забыла упомянуть поле, — а забывает она часто.
@@ -1078,7 +1447,10 @@ def merge_long(long: LongTerm, items: dict[str, dict[str, str]], turn: int) -> l
             fresh[key] = Note(key=key, value=value, kind=kind, source="router",
                               turn=turn, at=time.time())
     for key, note in long.notes.items():          # моложе входа маршрутизатора — сохраняем
-        if note.turn >= turn and note.source == "tool" and key not in fresh:
+        # Инструмент агента и переток закрытой задачи: обе записи появляются в том же
+        # обращении и маршрутизатору на вход не попадали. Итог задачи особенно важен —
+        # с дня 15 задача закрывается ещё до его вызова, подтверждением из запроса.
+        if note.turn >= turn and note.source in ("tool", "handoff") and key not in fresh:
             fresh[key] = note
     long.notes = fresh
     _trim_notes(long)

@@ -60,7 +60,7 @@ from . import config
 
 logger = logging.getLogger("app.store")
 
-VERSION = 10  # версия схемы, хранится в PRAGMA user_version
+VERSION = 11  # версия схемы, хранится в PRAGMA user_version
 
 MAIN_BRANCH = 0  # основная ветка: строки в branches у неё нет, это просто «ветка 0»
 
@@ -148,6 +148,7 @@ USAGE_COLUMNS = {
     "invariant_tokens": "INTEGER NOT NULL DEFAULT 0",    # из контекста — свод нерушимых правил
     "invariant_items": "INTEGER NOT NULL DEFAULT 0",     # сколько правил в нём было
     "invariant_blocked": "INTEGER NOT NULL DEFAULT 0",   # ответ не дошёл до пользователя: нарушал правило
+    "state_blocked": "INTEGER NOT NULL DEFAULT 0",       # отклонённых переходов автомата за обращение
 }
 
 # Суммаризации: по строке на версию. Отдельная таблица, а не колонка в agents, потому
@@ -226,6 +227,12 @@ TASK_COLUMNS = {
     "paused": "INTEGER NOT NULL DEFAULT 0",
     "paused_turn": "INTEGER NOT NULL DEFAULT 0",
     "resuming": "INTEGER NOT NULL DEFAULT 0",
+    # Выполненные условия переходов и журнал попыток. Условие — вторая половина
+    # закона автомата (таблица отвечает «куда можно», отметка — «когда можно»), а
+    # журнал хранит и отклонённые попытки: отказ ничего не меняет, и без записи от
+    # него не осталось бы следа (см. config.TASK_GUARDS).
+    "gates": "TEXT NOT NULL DEFAULT '[]'",           # JSON: коды выполненных условий
+    "log": "TEXT NOT NULL DEFAULT '[]'",             # JSON: попытки перехода, включая отклонённые
     "steps": "TEXT NOT NULL DEFAULT '[]'",           # JSON: [{"text": ..., "done": bool}]
     "findings": "TEXT NOT NULL DEFAULT '[]'",        # JSON: добытые факты и промежуточные результаты
     "artifacts": "TEXT NOT NULL DEFAULT '[]'",       # JSON: созданные файлы

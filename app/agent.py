@@ -441,6 +441,10 @@ class TokenReport:
     task_expect: str = ""         # ожидаемое действие: чей ход и чего ждут
     task_paused: bool = False     # задача отложена: вместо карточки ушла закладка
     task_resumed: bool = False    # это первый ответ после паузы
+    task_gate: str = ""           # условие перехода на следующий этап, одной строкой
+    task_gate_ready: bool = True  # выполнено ли оно
+    state_blocked: int = 0        # сколько попыток перехода код отклонил за обращение
+    state_asked: str = ""         # запрос просил этап, которого код не даст (рубеж до генерации)
     pending_messages: int = 0     # ждут суммаризации
     pending_tokens: int = 0
     route_pending: int = 0        # ждут разбора маршрутизатором
@@ -669,6 +673,19 @@ class Agent:
     _state_before: str = field(default=config.AGENT_TASK_STATE, repr=False)  # этап на начало обращения
     _resumed_before: bool = field(default=False, repr=False)  # обращение началось сразу после паузы
     _rule_moves: int = field(default=0, repr=False)  # переходов по правилу за текущее обращение
+    # Задача закрылась в этом обращении. Нужно потому, что закрыть её теперь может и
+    # подтверждение из самого запроса — то есть ДО ответа: маршрутизатор об этом ещё
+    # не знает и продолжает описывать её как открытую.
+    _closed_now: bool = field(default=False, repr=False)
+    # Номер обращения, которое идёт прямо сейчас. Счётчик `turns` растёт в середине
+    # `ask()`, а автомат двигается и до ответа (подтверждение прямо в запросе), и
+    # после (совет маршрутизатора) — без общей отметки в журнале и в карточке стояли
+    # бы разные числа за одно и то же обращение.
+    _turn_mark: int = field(default=0, repr=False)
+    # Находка рубежа ДО генерации: в запросе просят этап, которого код не даст.
+    # Живёт одно обращение и уходит в инструкцию блоком, чтобы отказ объяснял
+    # ассистент своими словами, а не строка в интерфейсе после ответа.
+    _blocked: "memory.Blocked | None" = field(default=None, repr=False)
     _branch: dict = field(default_factory=_main_branch, repr=False)  # описание активной ветки
 
     def __post_init__(self) -> None:
@@ -731,6 +748,8 @@ class Agent:
         # отработает, — а решение об этом принимается здесь, до сборки запроса.
         self._resumed_before = bool(self._task is not None and self._task.resuming)
         self._rule_moves = 0
+        self._closed_now = False
+        self._turn_mark = self.turns + 1
         # Всё, что случилось с памятью по ходу обращения, копится здесь и достаётся
         # маршрутизатору уже заполненным: правила срабатывают не в конце, а сразу.
         self._live = memory.MemoryUpdate()
@@ -749,6 +768,12 @@ class Agent:
         # План — это уже задача: заводим карточку сразу, а не после ответа, иначе
         # рабочая память наполняется задним числом и движения этапов не видно.
         self._live_rules(plan, [])
+        # Автомат разбирается ДО генерации, и порядок здесь важен: сначала то, что
+        # пользователь подтвердил этим же сообщением («утверждаю»), и только потом
+        # проверка на запрещённый переход. Иначе «план утверждаю, приступай» получало
+        # бы отказ по условию, которое эта же фраза и выполняет.
+        self._screen_gates(text)                            #    подтверждение прямо в запросе
+        self._screen_state(text)                            #    рубеж автомата: просят запрещённый этап
         specs = self._specs()
         prompt = self._system_prompt(plan, conflicts=conflicts)
         summary_block = self._summary_block()               #    блоки слоёв внутри инструкции
@@ -794,6 +819,9 @@ class Agent:
             task_expect=self._task.expect_line() if task_block else "",
             task_paused=bool(task_block and self._task.paused),
             task_resumed=self._resumed_before,
+            task_gate=memory.gate_line(self._task) if task_block else "",
+            task_gate_ready=not (task_block and not memory.gate_state(self._task).get("ready", True)),
+            state_asked=self._blocked.what() if self._blocked else "",
             pending_messages=len(self._pending_summary),
             pending_tokens=tokens.measure_messages(self._pending_summary, self.model),
             route_pending=len(self._pending_route),
@@ -1041,6 +1069,11 @@ class Agent:
             tokens.observe(self.model, report.estimated, report.prompt_tokens)
         last_usage = raw.get("usage") or {}
         report.completion_tokens = last_usage.get("completion_tokens", 0)
+        # Сколько попыток перехода код отклонил за это обращение — считаем по журналу
+        # карточки, а не по трассе: журнал и есть то место, где попытка остаётся.
+        if self._task is not None:
+            report.state_blocked = sum(1 for item in self._task.log
+                                       if not item.get("ok") and item.get("turn") == self.turns)
         totals_usage = totals.usage() or {}
         report.total_prompt = totals_usage.get("prompt_tokens", 0)
         report.total_completion = totals_usage.get("completion_tokens", 0)
@@ -1148,9 +1181,12 @@ class Agent:
         if not self.working or self._task is None or not self._task.open or not self._task:
             return ""
         task, state = self._task, self._task.state
+        # Отказ автомата едет тем же блоком, что и карточка: он про эту же задачу, и
+        # платить за него должна рабочая память, а не «инструкция вообще».
+        note = memory.gate_note(self._blocked)
         if task.paused:
-            return memory.PAUSED_NOTE.format(bookmark=task.bookmark())
-        return memory.TASK_NOTE.format(
+            return memory.PAUSED_NOTE.format(bookmark=task.bookmark()) + note
+        return note + memory.TASK_NOTE.format(
             state=config.state_label(state),
             en=config.state_en(state),
             what=config.TASK_STATE_BY_CODE[state]["what"],
@@ -1159,6 +1195,7 @@ class Agent:
             current=task.current_step(),
             expect=task.expect_line() or "ход за вами",
             exit=config.state_exit(state) or "этап последний",
+            gate=memory.gate_line(task),
             task=task.text(config.state_sections(state)),
             # Просьба продолжить с места стоит ровно одно обращение — то самое,
             # которое идёт первым после паузы. Дальше продолжение уже не первое.
@@ -1287,6 +1324,55 @@ class Agent:
             self._notify("invariant", {"stage": "conflict",
                                        "items": [item.to_dict() for item in conflicts]})
         return conflicts
+
+    @property
+    def _turn_now(self) -> int:
+        """Номер текущего обращения — одинаковый до инкремента счётчика и после."""
+        return max(self.turns, self._turn_mark)
+
+    def _screen_gates(self, text: str) -> list[str]:
+        """Подтверждение условия, сказанное прямо в запросе, — и сразу переход по нему.
+
+        Это ответ на вопрос «почему ничего не происходит»: маршрутизатор советует
+        этап уже после ответа, и без этой проверки на «утверждаю, приступай» агент
+        отвечал бы «пока не могу, план не утверждён», а этап догонял бы разговор
+        обращением позже. Здесь же отметка ставится до генерации, код тут же
+        двигает автомат — и агент отвечает уже с нового этапа.
+        """
+        if not self.working or self._task is None or not self._task.open:
+            return []
+        codes = memory.screen_gates(text, self._task)
+        if not codes:
+            return []
+        self._apply_gates(self._task, codes, self._live, source="user")
+        self._apply_transition(self._task, memory.overdue_state(self._task), self._live,
+                               source="rule")
+        return codes
+
+    def _screen_state(self, text: str) -> "memory.Blocked | None":
+        """Рубеж автомата ДО генерации: не просит ли запрос этапа, которого код не даст.
+
+        Сам отказ — работа `transition()`, и она случится в любом случае. Но
+        случится она ПОСЛЕ ответа, в маршрутизаторе, и до тех пор агент успевает
+        радостно согласиться «перейти в done» — а пользователь видит согласие и
+        строку об отказе рядом. Поэтому попытка разбирается заранее: стоит это ноль
+        токенов, а ответ выходит честным с первого раза.
+
+        Молчит, когда рабочая память выключена: без карточки этапов нет и
+        перепрыгивать нечего.
+        """
+        self._blocked = None
+        if not self.working or self._task is None:
+            return None
+        blocked = memory.screen_transition(text, self._task)
+        if blocked is None:
+            return None
+        self._blocked = blocked
+        memory.note_attempt(self._task, blocked, self._turn_now)
+        logger.info("Агент «%s» [%s]: запрос просит этап «%s» — %s",
+                    self.profile.name, self.id, blocked.target, blocked.reason)
+        self._notify("state_block", {"stage": "request", "blocked": blocked.to_dict()})
+        return blocked
 
     def _enforce(self, answer: str, messages: list[dict], totals: _Totals) -> str:
         """Рубеж 2: сверить готовый ОТВЕТ со сводом и не пропустить нарушение.
@@ -1460,12 +1546,17 @@ class Agent:
             return
         if self._task is not None and self._task.paused:
             return          # отложенная задача не обрастает работой, которая уже не про неё
+        if self._closed_now:
+            # Задача закрылась прямо в этом обращении (пользователь подтвердил
+            # результат в самом запросе). Заводить следующую тем же обращением
+            # нельзя: получилась бы пустая карточка сразу после закрытой.
+            return
         # Заводить карточку по плану стоит, только если план и правда про дело:
         # планировщик выдаёт один шаг и на «напомни, что ты знаешь», и от этого
         # заводилась пустая задача-призрак (поймано на живом прогоне). Один шаг —
         # ждём маршрутизатора, он разберётся лучше.
         if self._task is not None or len(plan) > 1:
-            task = self._ensure_task(turn=self.turns + 1)
+            task = self._ensure_task(turn=self._turn_now)
             self._live.routes.extend(memory.rules_from_turn(
                 task, plan, steps, own=persona.TOOL_NAMES | invariants.TOOL_NAMES))
             self._apply_transition(task, memory.overdue_state(task), self._live, source="rule")
@@ -1610,6 +1701,7 @@ class Agent:
             "invariant_tokens": report.breakdown.invariants,
             "invariant_items": report.invariant_items,
             "invariant_blocked": int(self._guard.blocked),
+            "state_blocked": report.state_blocked,
         }
 
     def _trim_memory(self) -> None:
@@ -1772,11 +1864,6 @@ class Agent:
                 # продолжение давно не первое.
                 self._task.resuming = False
 
-        if self._task is not None and not self._task.open and task_before and task_before["open"]:
-            handed = memory.handoff(self._task, self._long, self.turns)
-            if handed is not None:
-                update.routes.append(handed)
-
         # Карточка, заведённая в этом обращении и оставшаяся без названия и цели, —
         # не задача, а призрак: маршрутизатор её не подтвердил. Выбрасываем, иначе в
         # архиве копятся пустые строки.
@@ -1894,6 +1981,13 @@ class Agent:
                 # сторону», чем «дело закончено», а завершает задачу только переход
                 # на этап «Готово».
                 return True
+            if self._closed_now:
+                # Задача закрылась в этом же обращении — подтверждение пришло прямо
+                # из запроса, и код довёл автомат до «Готово» ещё до ответа.
+                # Маршрутизатор об этом не знал и описывает её как открытую; завести
+                # по его ответу новую карточку значило бы начать пустую задачу сразу
+                # после закрытой.
+                return True
             task = self._ensure_task(card.get("title", ""), turn=self.turns)
             # Возврат к отложенному делу разбираем ПЕРВЫМ: пока стоит пауза, карточка
             # заморожена, и всё, что маршрутизатор про неё насчитал, применять нельзя.
@@ -1912,6 +2006,11 @@ class Agent:
             # «Проверку», откуда завершение было бы разрешено. Один шаг опоздания —
             # и просьба пользователя теряется (поймано на живом прогоне).
             self._apply_transition(task, memory.overdue_state(task), update, source="rule")
+            # Подтверждения — после того, как этап догнал факт, и до совета об этапе.
+            # Порядок здесь не вкусовой: «всё готово, заверши» на выполнении сначала
+            # уводит задачу на проверку правилом, и только там подтверждение
+            # результата вообще что-то значит.
+            self._apply_gates(task, card.get("gates") or [], update)
             wanted = card.get("state", "")
             if wanted == self._state_before and task.state != self._state_before:
                 # Маршрутизатор работал с состоянием на начало обращения и вернул
@@ -1932,6 +2031,7 @@ class Agent:
         wanted: str,
         update: memory.MemoryUpdate,
         source: str = "router",
+        turn: int | None = None,
     ) -> None:
         """Применить этап, который попросили, — или отказать.
 
@@ -1948,6 +2048,10 @@ class Agent:
         """
         if not wanted:
             return
+        # Номер обращения приходит снаружи там, где счётчик ещё не вырос: переход
+        # бывает и до ответа (подтверждение прямо в запросе), и после (совет
+        # маршрутизатора), а в журнале и в перетоке должно стоять одно число.
+        now = self._turn_now if turn is None else turn
         if source == "rule" and self._rule_moves:
             # Не больше одного перехода по правилу за обращение. Иначе выходит так:
             # агент в первом же ответе составил план и записал файл, маршрутизатор
@@ -1959,7 +2063,7 @@ class Agent:
                         self.profile.name, self.id, task.state, wanted)
             return
         try:
-            moved = memory.transition(task, wanted, self.turns)
+            moved = memory.transition(task, wanted, now, source)
         except memory.TransitionError as e:
             update.rejected = str(e)
             update.routes.append(memory.Route(
@@ -1971,6 +2075,14 @@ class Agent:
         if not moved:
             return
         update.moved.append(moved)
+        if not task.open:
+            # Задача закрылась — её итог переезжает в долговременную память здесь же.
+            # Место одно на все пути (модель, правило, кнопка): закрыть задачу можно
+            # только переходом на «Готово», значит и переток должен жить рядом с ним.
+            self._closed_now = True
+            handed = memory.handoff(task, self._long, now)
+            if handed is not None:
+                update.routes.append(handed)
         if source == "rule":
             self._rule_moves += 1
         update.routes.append(memory.Route(
@@ -1982,6 +2094,44 @@ class Agent:
         logger.info("Агент «%s» [%s]: этап задачи «%s» — %s (%s)",
                     self.profile.name, self.id, task.title, moved,
                     config.note_source_label(source))
+
+    def _apply_gates(
+        self,
+        task: "memory.Task",
+        codes: list,
+        update: memory.MemoryUpdate,
+        source: str = "router",
+        turn: int | None = None,
+    ) -> None:
+        """Отметить условия переходов, которые пользователь подтвердил в этом обмене.
+
+        Отметка — не переход, а разрешение на него: «утверждаю план» ничего не
+        двигает само по себе, но без него планирование не кончится. Ставит её
+        `memory.approve`, и она же отказывает, если подтверждать нечего или условие
+        относится к другому этапу, — отказ уходит в трассу, как и у переходов.
+        """
+        now = self._turn_now if turn is None else turn
+        for code in codes or ():
+            try:
+                marked = memory.approve(task, code, now, source)
+            except memory.TransitionError as e:
+                update.rejected = str(e)
+                update.routes.append(memory.Route(
+                    layer="working", action="reject", kind="gate", source=source,
+                    what=f"подтверждение «{code}» отклонено",
+                ))
+                logger.warning("Агент «%s» [%s]: %s", self.profile.name, self.id, e)
+                continue
+            if not marked:
+                continue
+            update.gates.append(marked)
+            update.routes.append(memory.Route(
+                layer="working", action="add", kind="gate", source=source,
+                what=f"условие выполнено: {marked}",
+            ))
+            self._notify("gate", {"gate": marked, "source": source, "task": task.to_dict()})
+            logger.info("Агент «%s» [%s]: условие «%s» подтверждено (%s)",
+                        self.profile.name, self.id, marked, config.note_source_label(source))
 
     def _apply_pause(
         self,
@@ -2572,33 +2722,45 @@ class Agent:
 
     # -------------------------------------------------------- рабочая память --
 
-    def close_task(self) -> dict:
-        """Завершить задачу: довести автомат до «Готово» по всем оставшимся этапам.
+    def advance_task(self) -> dict:
+        """Подтвердить условие текущего этапа и двинуть задачу на следующий.
 
-        Этапы агент проходит сам — по факту работы и по решению маршрутизатора, — и
-        водить его за руку не нужно. Но у человека должно остаться одно честное
-        действие: «всё, дело закрыто». Оно не ломает автомат и не прыгает через
-        этапы, а прокручивает их по порядку, каждый — через ту же `transition`;
-        в ленте видно весь пройденный путь. Итог задачи при этом переезжает в
-        долговременную память.
+        Единственное действие человека в автомате, кроме паузы, — и оно идёт ровно
+        тем же путём, что и совет модели: `approve()` ставит отметку, `transition()`
+        сверяется с таблицей и условиями. Прыгнуть им нельзя: с планирования кнопка
+        уводит на выполнение, и никуда больше, а задача завершается только с этапа
+        проверки. До дня 15 здесь была кнопка «Завершить задачу», которая
+        прокручивала оставшиеся этапы разом, — то есть ровно то, что задание
+        запрещает: финал без валидации.
+
+        Человек в автомате по-прежнему не привилегированный: нечего утверждать
+        (плана нет, шаги не закрыты) — кнопка получает тот же отказ, что и модель.
         """
         if self._task is None or not self._task.open:
-            raise AgentError("Открытой задачи нет — завершать нечего.")
-        moved = []
-        for target in memory.path_to_done(self._task.state):
-            try:
-                step = memory.transition(self._task, target, self.turns)
-            except memory.TransitionError as e:      # линейный путь всегда разрешён
-                raise AgentError(str(e)) from e
-            if step:
-                moved.append(step)
-        handed = memory.handoff(self._task, self._long, self.turns)
+            raise AgentError("Открытой задачи нет — двигать нечего.")
+        act = memory.act_for(self._task)
+        if not act:
+            raise AgentError(
+                "Задача на паузе — сначала продолжите работу." if self._task.paused
+                else "Этап последний: дальше двигаться некуда.")
+        update = memory.MemoryUpdate()
+        if act.get("code"):
+            self._apply_gates(self._task, [act["code"]], update, source="user")
+            if update.rejected:
+                raise AgentError(update.rejected)
+        self._apply_transition(self._task, act["to"], update, source="user")
+        if update.rejected:
+            raise AgentError(update.rejected)
+        handed = next((r for r in update.routes if r.source == "handoff"), None)
+        memory.refresh_expect(self._task)
         card = self._task.to_dict()
         self._persist_task()
-        logger.info("Агент «%s» [%s]: задача «%s» завершена вручную — %s%s",
-                    self.profile.name, self.id, self._task.title, " · ".join(moved) or "уже на месте",
+        logger.info("Агент «%s» [%s]: задача «%s» — %s (человек)%s",
+                    self.profile.name, self.id, self._task.title,
+                    " · ".join(update.moved) or "без перехода",
                     f" · в долговременную: {handed.what}" if handed else "")
-        return {"task": card, "moved": moved, "handoff": handed.what if handed else ""}
+        return {"task": card, "moved": list(update.moved), "gates": list(update.gates),
+                "handoff": handed.what if handed else ""}
 
     def pause_task(self) -> dict:
         """Отложить задачу: автомат замирает на текущем этапе.
